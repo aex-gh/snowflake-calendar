@@ -1,8 +1,7 @@
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 -- Step 1: Setup network rules to allow access to data.gov.au
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-CREATE
-OR REPLACE NETWORK RULE allow_data_gov_au MODE = EGRESS TYPE = HOST_PORT VALUE_LIST = ('data.gov.au:443');
+CREATE OR REPLACE NETWORK RULE allow_data_gov_au MODE = EGRESS TYPE = HOST_PORT VALUE_LIST = ('data.gov.au:443');
 
 CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION apis_access_integration
   ALLOWED_NETWORK_RULES = (allow_data_gov_au) -- Specifies the network rules that this integration uses to control network access.
@@ -10,61 +9,41 @@ CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION apis_access_integration
 
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 -- Step 2: Setup LOAD_AU_HOLIDAYS(DATABASE_NAME, SCHEMA_NAME) stored procedure
+/* TODO: rework to bring in all holidays using https://data.gov.au/data/api/action/datastore_search_sql?sql=SELECT%20*%20from%20%2233673aca-0857-42e5-b8f0-9981b4755686%22%20WHERE%20%22Date%22%20%3E=%20%2720210101%27.
+   TODO: need to modify for an initial load then ongoing by changing the SQL select to the YYYY0101 number for the current year. Also need to check if this returns anything because the API may change.
+*/
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-create procedure LOAD_AU_HOLIDAYS(DATABASE_NAME VARCHAR, SCHEMA_NAME VARCHAR)
-returns String -- Returns a string indicating the success or failure of the procedure.
-language python -- Specifies that the procedure is written in Python.
-runtime_version=3.11 -- Specifies the Python runtime version to use.
-packages=('pandas==2.2.3','requests==2.32.3','snowflake-snowpark-python==*') -- Specifies the Python packages required by the procedure.  Explicit versioning is recommended for stability.
-handler='main' -- Specifies the entry point function in the Python code.
-comment='Load Australian holidays from data.gov.au' -- Adds a comment to the stored procedure for documentation.
-EXTERNAL_ACCESS_INTEGRATIONS = (apis_access_integration)  -- Links the stored procedure to the external access integration, granting it permission to access external resources.
-as
+CREATE OR REPLACE PROCEDURE LOAD_AU_HOLIDAYS(DATABASE_NAME VARCHAR, SCHEMA_NAME VARCHAR)
+RETURNS String
+LANGUAGE PYTHON
+RUNTIME_VERSION=3.11
+PACKAGES=('pandas==2.2.3','requests==2.32.3','snowflake-snowpark-python==*')
+HANDLER='main'
+COMMENT='Load Australian holidays from data.gov.au with retry logic and CSV fallback'
+EXTERNAL_ACCESS_INTEGRATIONS = (apis_access_integration)
+AS
 '
 import requests
 import pandas as pd
+import time
+import io
 from datetime import datetime
 from snowflake.snowpark import Session
 
-STAGE_NAME = "AU_PUBLIC_HOLIDAYS_STAGE" # Name of the Snowflake stage used for temporary data storage.
-TABLE_NAME = "AU_PUBLIC_HOLIDAYS" # Name of the Snowflake table where the holiday data is loaded.
-API_URL = "https://data.gov.au/data/api/action/datastore_search?resource_id=4d4d744b-50ed-45b9-ae77-760bc478ad75" # URL of the data.gov.au API endpoint for public holiday data.
+STAGE_NAME = "AU_PUBLIC_HOLIDAYS_STAGE"
+TABLE_NAME = "AU_PUBLIC_HOLIDAYS"
+BASE_API_URL = "https://data.gov.au/data/api/action/datastore_search"
+SQL_API_URL = "https://data.gov.au/data/api/action/datastore_search_sql"
+RESOURCE_ID = "33673aca-0857-42e5-b8f0-9981b4755686"  # Public holidays resource ID
+MAX_RETRIES = 3
+RETRY_DELAY = 5  # seconds
+FALLBACK_FILE = "australian_holidays_fallback.csv"  # Fallback data filename (CSV instead of JSON)
 
-def fetch_api_data(api_url):
+def create_table_if_not_exists(session, database_name, schema_name, table_name):
     """
-    Fetch data from the data.gov.au API endpoint
+    Create the holidays table if it doesn\'t exist
     """
     try:
-        response = requests.get(api_url)
-        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-        data = response.json()
-
-        if data[''success'']:
-            return data[''result''][''records'']
-        else:
-            raise Exception("API request was not successful")
-
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching data: {e}")
-        raise # Re-raise the exception to halt execution and report the error.
-
-def create_stage(session, stage_name, database_name, schema_name):
-    """
-    Create an internal stage if it doesn\'t exist
-    """
-    try:
-        fully_qualified_stage = f"{database_name}.{schema_name}.{stage_name}"
-        session.sql(f"CREATE STAGE IF NOT EXISTS {fully_qualified_stage}").collect() # Executes SQL to create the stage if it doesn\'t exist.
-    except Exception as e:
-        print(f"Error creating stage: {e}")
-        raise # Re-raise the exception.
-
-def load_data_to_stage(session, df, stage_name, table_name, database_name, schema_name):
-    """
-    Load DataFrame to Snowflake stage and create table
-    """
-    try:
-        # Create table if not exists
         create_table_sql = f"""
         CREATE TABLE IF NOT EXISTS {database_name}.{schema_name}.{table_name} (
             HOLIDAY_ID NUMBER,
@@ -73,66 +52,356 @@ def load_data_to_stage(session, df, stage_name, table_name, database_name, schem
             INFORMATION VARCHAR(1000),
             MORE_INFORMATION VARCHAR(255),
             JURISDICTION VARCHAR(10),
-            LOADED_AT TIMESTAMP_NTZ -- TIMESTAMP_NTZ: Timestamp without time zone.  Suitable for recording when the data was loaded.
+            LOADED_AT TIMESTAMP_NTZ,
+            DATA_SOURCE VARCHAR(50)  -- New column to track data source
         )
         """
-
-        session.sql(create_table_sql).collect() # Executes SQL to create the table if it doesn\'t exist.
-
-        # Process the date column
-        df[''HOLIDAY_DATE''] = pd.to_datetime(df[''Date''], format=''%Y%m%d'').dt.date # Convert the "Date" column to a date format (%Y%m%d).
-
-        # Rename columns to match table schema
-        df = df.rename(columns={
-            ''_id'': ''HOLIDAY_ID'',
-            ''Holiday Name'': ''HOLIDAY_NAME'',
-            ''Information'': ''INFORMATION'',
-            ''More Information'': ''MORE_INFORMATION'',
-            ''Jurisdiction'': ''JURISDICTION''
-        })
-
-        # Add load timestamp
-        df[''LOADED_AT''] = datetime.now() # Adds a column with the current timestamp to track when the data was loaded.
-
-        # Select and reorder columns to match table schema
-        df = df[[
-            ''HOLIDAY_ID'',
-            ''HOLIDAY_DATE'',
-            ''HOLIDAY_NAME'',
-            ''INFORMATION'',
-            ''MORE_INFORMATION'',
-            ''JURISDICTION'',
-            ''LOADED_AT''
-        ]]
-
-        # Convert pandas DataFrame to Snowpark DataFrame
-        snowdf = session.create_dataframe(df) # Converts the Pandas DataFrame to a Snowpark DataFrame for efficient interaction with Snowflake.
-
-        # Write DataFrame to Snowflake table
-        snowdf.write \\
-            .mode("append") \\
-            .save_as_table(f"{database_name}.{schema_name}.{table_name}")  # Append to the table if it exists.  Use "overwrite" to replace existing data. Saves the Snowpark DataFrame to the specified Snowflake table.
-
-        return f"Successfully loaded {len(df)} rows into {database_name}.{schema_name}.{table_name}"
-
+        session.sql(create_table_sql).collect()
+        return True
     except Exception as e:
-        error_msg = f"Error loading data to stage: {e}"
-        print(error_msg)
-        return error_msg
+        print(f"Error creating table: {e}")
+        return False
 
-def main(session, DATABASE_NAME, SCHEMA_NAME):
+def check_table_exists(session, database_name, schema_name, table_name):
+    """
+    Check if the holidays table exists and has data
+    """
     try:
-        # Fetch data from API
-        data = fetch_api_data(API_URL)
+        result = session.sql(f"SELECT COUNT(*) AS count FROM {database_name}.{schema_name}.{table_name}").collect()
+        return result[0]["COUNT"] > 0
+    except Exception:
+        return False
+
+def get_latest_holiday_date(session, database_name, schema_name, table_name):
+    """
+    Get the latest holiday date from the existing table
+    """
+    try:
+        result = session.sql(f"""
+            SELECT MAX(HOLIDAY_DATE) AS max_date
+            FROM {database_name}.{schema_name}.{table_name}
+        """).collect()
+
+        max_date = result[0]["MAX_DATE"]
+        if max_date:
+            return max_date.strftime("%Y%m%d")
+        return None
+    except Exception as e:
+        print(f"Error getting latest holiday date: {e}")
+        return None
+
+def fetch_api_data_with_retry(api_url, params=None):
+    """
+    Fetch data from API with retry logic
+    """
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.get(api_url, params=params, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+
+            if data["success"]:
+                return data
+            else:
+                print(f"API request unsuccessful: {data.get(\'error\', \'Unknown error\')}")
+        except requests.exceptions.RequestException as e:
+            print(f"Attempt {attempt + 1}/{MAX_RETRIES} failed: {e}")
+
+        # Don\'t sleep on the last attempt
+        if attempt < MAX_RETRIES - 1:
+            time.sleep(RETRY_DELAY)
+
+    # All attempts failed
+    return None
+
+def build_sql_query(latest_date=None):
+    """
+    Build the SQL query for the API, using the latest date if available
+    """
+    if latest_date:
+        # Incremental load - fetch only newer records
+        return f"SELECT * from \\"{RESOURCE_ID}\\" WHERE \\"Date\\" > \'{latest_date}\'"
+    else:
+        # Initial load - fetch all records
+        return f"SELECT * from \\"{RESOURCE_ID}\\""
+
+def fetch_holidays_via_sql_api(latest_date=None):
+    """
+    Fetch holidays using the SQL API endpoint
+    """
+    sql_query = build_sql_query(latest_date)
+    params = {"sql": sql_query}
+
+    print(f"Fetching holidays with query: {sql_query}")
+    data = fetch_api_data_with_retry(SQL_API_URL, params)
+
+    if data and "result" in data and "records" in data["result"]:
+        return data["result"]["records"]
+    return None
+
+def fetch_holidays_via_standard_api():
+    """
+    Fallback to standard API if SQL API fails
+    """
+    params = {"resource_id": RESOURCE_ID, "limit": 1000}  # Adjust limit as needed
+    data = fetch_api_data_with_retry(BASE_API_URL, params)
+
+    if data and "result" in data and "records" in data["result"]:
+        return data["result"]["records"]
+    return None
+
+def check_fallback_data_exists(session, database_name, schema_name, stage_name):
+    """
+    Check if fallback CSV data file exists in the stage
+    """
+    try:
+        result = session.sql(f"""
+            SELECT COUNT(*) AS count
+            FROM TABLE(INFORMATION_SCHEMA.FILES(
+                PATTERN=>\'.*{FALLBACK_FILE}\',
+                STAGE_NAME=>\'@{database_name}.{schema_name}.{stage_name}\'
+            ))
+        """).collect()
+        return result[0]["COUNT"] > 0
+    except Exception as e:
+        print(f"Error checking fallback data: {e}")
+        return False
+
+def load_fallback_data(session, database_name, schema_name, stage_name):
+    """
+    Load fallback data from CSV in stage if available
+    """
+    try:
+        # Create a file format for CSV
+        session.sql(f"""
+            CREATE FILE FORMAT IF NOT EXISTS {database_name}.{schema_name}.csv_format
+            TYPE = CSV
+            FIELD_DELIMITER = \',\'
+            SKIP_HEADER = 1
+            NULL_IF = (\'NULL\', \'\')
+            FIELD_OPTIONALLY_ENCLOSED_BY = \'\"\'
+        """).collect()
+
+        # Load the CSV data into a temporary table
+        temp_table = f"{database_name}.{schema_name}.TEMP_HOLIDAYS"
+        session.sql(f"""
+            CREATE OR REPLACE TEMPORARY TABLE {temp_table} AS
+            SELECT
+                $1::NUMBER AS HOLIDAY_ID,
+                TO_DATE($2, \'YYYYMMDD\') AS HOLIDAY_DATE,
+                $3::VARCHAR AS HOLIDAY_NAME,
+                $4::VARCHAR AS INFORMATION,
+                $5::VARCHAR AS MORE_INFORMATION,
+                $6::VARCHAR AS JURISDICTION
+            FROM @{database_name}.{schema_name}.{stage_name}/{FALLBACK_FILE}
+            (FILE_FORMAT => \'{database_name}.{schema_name}.csv_format\')
+        """).collect()
+
+        # Convert to records format (similar to API response)
+        df = session.table(temp_table).to_pandas()
+
+        # Clean up temporary table
+        session.sql(f"DROP TABLE IF EXISTS {temp_table}").collect()
+
+        if not df.empty:
+            # Convert df back to records format (list of dicts)
+            # Convert HOLIDAY_DATE back to string format for consistency with API
+            df[\'Date\'] = df[\'HOLIDAY_DATE\'].dt.strftime(\'%Y%m%d\')
+
+            # Map back to original API column names for consistency
+            records = df.rename(columns={
+                \'HOLIDAY_ID\': \'_id\',
+                \'HOLIDAY_NAME\': \'Holiday Name\',
+                \'INFORMATION\': \'Information\',
+                \'MORE_INFORMATION\': \'More Information\',
+                \'JURISDICTION\': \'Jurisdiction\'
+            }).to_dict(\'records\')
+
+            return records
+
+        return None
+    except Exception as e:
+        print(f"Error loading fallback data: {e}")
+        return None
+
+def save_fallback_data(session, database_name, schema_name, stage_name, data):
+    """
+    Save the latest API data as CSV fallback for future use
+    """
+    try:
+        # Convert data to DataFrame
+        df = pd.DataFrame(data)
+
+        # Ensure we have all the right columns in the right order
+        columns_order = [
+            \'_id\',
+            \'Date\',
+            \'Holiday Name\',
+            \'Information\',
+            \'More Information\',
+            \'Jurisdiction\'
+        ]
+
+        # Filter to only include the columns we need
+        df = df[columns_order]
+
+        # Convert DataFrame to CSV
+        csv_buffer = io.StringIO()
+        df.to_csv(csv_buffer, index=False)
+        csv_str = csv_buffer.getvalue()
+
+        # Write to a temporary file
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=\'.csv\', delete=False) as temp_file:
+            temp_file_path = temp_file.name
+            temp_file.write(csv_str.encode())
+
+        # Upload to stage
+        session.file.put(
+            temp_file_path,
+            f"@{database_name}.{schema_name}.{stage_name}/{FALLBACK_FILE}",
+            auto_compress=False,
+            overwrite=True
+        )
+
+        # Clean up temporary file
+        import os
+        os.unlink(temp_file_path)
+
+        return True
+    except Exception as e:
+        print(f"Error saving fallback data: {e}")
+        return False
+
+def create_stage(session, stage_name, database_name, schema_name):
+    """
+    Create an internal stage if it doesn\'t exist
+    """
+    try:
+        fully_qualified_stage = f"{database_name}.{schema_name}.{stage_name}"
+        session.sql(f"CREATE STAGE IF NOT EXISTS {fully_qualified_stage}").collect()
+        return True
+    except Exception as e:
+        print(f"Error creating stage: {e}")
+        return False
+
+def process_and_load_data(session, data, database_name, schema_name, table_name, data_source):
+    """
+    Process the holiday data and load it into Snowflake
+    """
+    try:
+        if not data or len(data) == 0:
+            return "No new records to load"
 
         # Convert to DataFrame
         df = pd.DataFrame(data)
 
-        # Create stage
-        create_stage(session, STAGE_NAME, DATABASE_NAME, SCHEMA_NAME)
+        # Check if the expected columns exist
+        required_columns = [\'_id\', \'Date\', \'Holiday Name\', \'Information\', \'More Information\', \'Jurisdiction\']
+        missing_columns = [col for col in required_columns if col not in df.columns]
 
-        # Load data to stage and create table
-        return load_data_to_stage(session, df, STAGE_NAME, TABLE_NAME, DATABASE_NAME, SCHEMA_NAME)
+        if missing_columns:
+            return f"API structure has changed. Missing columns: {missing_columns}"
+
+        # Process the date column
+        df[\'HOLIDAY_DATE\'] = pd.to_datetime(df[\'Date\'], format=\'%Y%m%d\').dt.date
+
+        # Rename columns to match table schema
+        df = df.rename(columns={
+            \'_id\': \'HOLIDAY_ID\',
+            \'Holiday Name\': \'HOLIDAY_NAME\',
+            \'Information\': \'INFORMATION\',
+            \'More Information\': \'MORE_INFORMATION\',
+            \'Jurisdiction\': \'JURISDICTION\'
+        })
+
+        # Add load timestamp and data source
+        df[\'LOADED_AT\'] = datetime.now()
+        df[\'DATA_SOURCE\'] = data_source  # Add the data source
+
+        # Select and reorder columns to match table schema
+        df = df[[
+            \'HOLIDAY_ID\',
+            \'HOLIDAY_DATE\',
+            \'HOLIDAY_NAME\',
+            \'INFORMATION\',
+            \'MORE_INFORMATION\',
+            \'JURISDICTION\',
+            \'LOADED_AT\',
+            \'DATA_SOURCE\'  # Include the data source in the output
+        ]]
+
+        # Convert pandas DataFrame to Snowpark DataFrame
+        snowdf = session.create_dataframe(df)
+
+        # Write DataFrame to Snowflake table
+        snowdf.write.mode("append").save_as_table(f"{database_name}.{schema_name}.{table_name}")
+
+        return f"Successfully loaded {len(df)} rows into {database_name}.{schema_name}.{table_name}"
+    except Exception as e:
+        error_msg = f"Error processing and loading data: {e}"
+        print(error_msg)
+        return error_msg
+
+def main(session, DATABASE_NAME, SCHEMA_NAME):
+    """
+    Main execution function
+    """
+    try:
+        # Create stage
+        if not create_stage(session, STAGE_NAME, DATABASE_NAME, SCHEMA_NAME):
+            return "Failed to create stage"
+
+        # Create table if not exists
+        if not create_table_if_not_exists(session, DATABASE_NAME, SCHEMA_NAME, TABLE_NAME):
+            return "Failed to create table"
+
+        # Check if table has data
+        has_data = check_table_exists(session, DATABASE_NAME, SCHEMA_NAME, TABLE_NAME)
+
+        # Get the latest holiday date if we have data
+        latest_date = None
+        if has_data:
+            latest_date = get_latest_holiday_date(session, DATABASE_NAME, SCHEMA_NAME, TABLE_NAME)
+            print(f"Latest holiday date in database: {latest_date}")
+
+        # Try SQL API first
+        holiday_data = fetch_holidays_via_sql_api(latest_date)
+        data_source = "data.gov.au SQL API"
+
+        # If SQL API fails, try standard API
+        if not holiday_data:
+            print("SQL API failed, trying standard API...")
+            holiday_data = fetch_holidays_via_standard_api()
+            data_source = "data.gov.au Standard API"
+
+        # If both APIs fail, try fallback data
+        if not holiday_data:
+            print("Both APIs failed, checking for fallback data...")
+            if check_fallback_data_exists(session, DATABASE_NAME, SCHEMA_NAME, STAGE_NAME):
+                holiday_data = load_fallback_data(session, DATABASE_NAME, SCHEMA_NAME, STAGE_NAME)
+                if holiday_data:
+                    print("Using fallback data from CSV")
+                    data_source = "Local CSV Fallback"
+                    # Filter fallback data to only include records after latest_date if incremental
+                    if latest_date:
+                        holiday_data = [record for record in holiday_data
+                                       if int(record.get("Date", "0")) > int(latest_date)]
+
+        # If we have data by any method, process and load it
+        if holiday_data:
+            # Save current data as fallback for future use - only save API data, not already fallback data
+            if "API" in data_source:
+                save_fallback_data(session, DATABASE_NAME, SCHEMA_NAME, STAGE_NAME, holiday_data)
+
+            # Add timestamp to data source for audit trail
+            timestamped_data_source = f"{data_source} ({datetime.now().strftime(\'%Y-%m-%d %H:%M:%S\')})"
+
+            # Process and load the data
+            result = process_and_load_data(session, holiday_data, DATABASE_NAME, SCHEMA_NAME, TABLE_NAME, timestamped_data_source)
+            return f"Source: {data_source}. {result}"
+        else:
+            return "Failed to retrieve holiday data from API and no fallback data available"
 
     except Exception as e:
         error_msg = f"Error in main process: {e}"
@@ -143,7 +412,7 @@ def main(session, DATABASE_NAME, SCHEMA_NAME):
 
 -- LOAD PROCEDURE EXAMPLE
 -- Example of how to call the stored procedure.  Replace with your database and schema names.
--- call load_au_holidays('DBT_SPG_DW','STAGING');
+-- call load_au_holidays('SPG_DAP01','PBI');
 
 -- DROP PROCEDURE EXAMPLE
 -- Example of how to drop the stored procedure.  Use with caution!
@@ -170,12 +439,67 @@ FROM SPG_DAP01.PBI.AU_PUBLIC_HOLIDAYS;
 ALTER SESSION SET TIMEZONE = 'Australia/Adelaide';
 
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
--- STEP 6: Create the stored procedure to build the business calendar
+-- STEP 6A: Create function for date spine
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION SPG_DAP01.PBI.FN_GENERATE_DATE_SPINE(
+    start_date TIMESTAMP_NTZ,
+    end_date TIMESTAMP_NTZ,
+    date_grain VARCHAR,  -- 'MINUTE', 'HOUR', 'DAY', 'WEEK', 'MONTH', 'QUARTER', 'YEAR'
+    timezone VARCHAR DEFAULT 'UTC'  -- e.g., 'Australia/Sydney', 'Europe/London', 'America/New_York'
+)
+RETURNS TABLE (
+    calendar_date TIMESTAMP_NTZ,
+    calendar_date_tz TIMESTAMP_TZ,
+    timezone VARCHAR
+)
+AS
+$$
+    WITH row_count_calc AS (
+        SELECT
+            GREATEST(
+                DATEDIFF('MINUTE', start_date, end_date) * CASE WHEN UPPER(date_grain) = 'MINUTE' THEN 1 ELSE 0 END,
+                DATEDIFF('HOUR', start_date, end_date) * CASE WHEN UPPER(date_grain) = 'HOUR' THEN 1 ELSE 0 END,
+                DATEDIFF('DAY', start_date, end_date) * CASE WHEN UPPER(date_grain) IN ('DAY', '') OR date_grain IS NULL THEN 1 ELSE 0 END,
+                DATEDIFF('WEEK', start_date, end_date) * CASE WHEN UPPER(date_grain) = 'WEEK' THEN 1 ELSE 0 END,
+                DATEDIFF('MONTH', start_date, end_date) * CASE WHEN UPPER(date_grain) = 'MONTH' THEN 1 ELSE 0 END,
+                DATEDIFF('QUARTER', start_date, end_date) * CASE WHEN UPPER(date_grain) = 'QUARTER' THEN 1 ELSE 0 END,
+                DATEDIFF('YEAR', start_date, end_date) * CASE WHEN UPPER(date_grain) = 'YEAR' THEN 1 ELSE 0 END,
+                1  -- Ensure at least 1 row
+            ) + 1 AS row_count_needed
+    ),
+    date_series AS (
+        SELECT
+            CASE
+                WHEN UPPER(date_grain) = 'MINUTE'  THEN DATEADD('MINUTE', seq4(), start_date)
+                WHEN UPPER(date_grain) = 'HOUR'    THEN DATEADD('HOUR', seq4(), start_date)
+                WHEN UPPER(date_grain) = 'WEEK'    THEN DATEADD('WEEK', seq4(), start_date)
+                WHEN UPPER(date_grain) = 'MONTH'   THEN DATEADD('MONTH', seq4(), start_date)
+                WHEN UPPER(date_grain) = 'QUARTER' THEN DATEADD('QUARTER', seq4(), start_date)
+                WHEN UPPER(date_grain) = 'YEAR'    THEN DATEADD('YEAR', seq4(), start_date)
+                ELSE DATEADD('DAY', seq4(), start_date)  -- Default to DAY
+            END AS calendar_date
+        FROM row_count_calc,
+             TABLE(GENERATOR(ROWCOUNT => row_count_needed))
+    )
+
+    SELECT
+        calendar_date,
+        CONVERT_TIMEZONE('UTC', timezone, calendar_date) AS calendar_date_tz,
+        timezone
+    FROM date_series
+    WHERE calendar_date <= end_date
+    ORDER BY calendar_date
+$$;
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- STEP 6B: Create the stored procedure to build the business calendar
 -- TODO: make the date to end a variable to pass through
 -- TODO: Qualify the F445 calendar components
-
-CREATE OR REPLACE PROCEDURE SPG_DAP01.PBI.SP_BUILD_BUSINESS_CALENDAR()
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE SPG_DAP01.PBI.SP_BUILD_BUSINESS_CALENDAR(
+    start_date DATE DEFAULT '2015-01-01',
+    end_date DATE DEFAULT '2035-12-31',
+    date_grain VARCHAR DEFAULT 'DAY'
+)
 RETURNS VARCHAR
 LANGUAGE SQL
 AS
@@ -187,11 +511,12 @@ BEGIN
     CREATE OR REPLACE TABLE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE
     AS
     WITH date_generator AS (
-        SELECT '2015-01-01'::DATE AS calendar_date
-        UNION ALL
-        SELECT DATEADD(DAY, 1, calendar_date)
-        FROM date_generator
-        WHERE calendar_date < '2035-12-31'
+        SELECT calendar_date::DATE AS calendar_date
+        FROM TABLE(SPG_DAP01.PBI.FN_GENERATE_DATE_SPINE(
+            :start_date,
+            :end_date,
+            :date_grain
+        ))
     ),
     -- Pivot holidays by jurisdiction to avoid duplication
     holiday_by_jurisdiction AS (
@@ -205,14 +530,14 @@ BEGIN
             MAX(CASE WHEN UPPER(h.STATE) = 'TAS' THEN 1 ELSE 0 END) AS is_holiday_tas,
             MAX(CASE WHEN UPPER(h.STATE) = 'ACT' THEN 1 ELSE 0 END) AS is_holiday_act,
             MAX(CASE WHEN UPPER(h.STATE) = 'NT' THEN 1 ELSE 0 END) AS is_holiday_nt,
-            CASE 
+            CASE
                 -- If already marked as NATIONAL in the data
                 WHEN MAX(CASE WHEN UPPER(STATE) = 'NATIONAL' THEN 1 ELSE 0 END) = 1 THEN 1
                 -- If all states/territories have the same holiday
-                WHEN MIN(CASE 
-                        WHEN UPPER(STATE) IN ('NSW', 'VIC', 'QLD', 'SA', 'WA', 'TAS', 'ACT', 'NT') THEN 1 
-                        ELSE 0 
-                        END) = 1 
+                WHEN MIN(CASE
+                        WHEN UPPER(STATE) IN ('NSW', 'VIC', 'QLD', 'SA', 'WA', 'TAS', 'ACT', 'NT') THEN 1
+                        ELSE 0
+                        END) = 1
                 AND COUNT(DISTINCT UPPER(STATE)) >= 8 THEN 1
                 ELSE 0
             END AS is_holiday_national,
@@ -535,7 +860,7 @@ Update Frequency: Infrequent (e.g., yearly) or when holiday/fiscal structure cha
 Query Interface: Use the BUSINESS_CALENDAR view for analysis.
 Version: v1.5';
 
--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------    
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 -- Step 8: Create the View with Dynamic Relative Time Flags and inline column comments
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 BEGIN
@@ -676,11 +1001,6 @@ CREATE OR REPLACE VIEW SPG_DAP01.PBI.BUSINESS_CALENDAR (
     retail_season_sort_key COMMENT 'Sort key for retail seasons to ensure proper ordering in BI tools.',
     holiday_proximity COMMENT 'Identifies specific periods near major holidays: ''Christmas Eve Period'' (Dec 20-24), ''Boxing Day'' (Dec 26), ''Post-Christmas Sale'' (Dec 27-31). NULL otherwise.',
     holiday_proximity_sort_key COMMENT 'Sort key for holiday proximity periods to ensure proper ordering in BI tools.',
-
-    -- Metadata columns
-    dw_created_ts COMMENT 'Timestamp (LTZ) when the row/table was created or last updated by the procedure.',
-    dw_source_system COMMENT 'The name of the procedure that generated this data (BUILD_BUSINESS_CALENDAR_SP).',
-    dw_version_desc COMMENT 'Version description of the logic used to generate the data.',
 
     -- Dynamic relative time flags
     is_current_date COMMENT 'Indicator (1/0) if this date IS CURRENT_DATE(). Calculated dynamically.',
@@ -863,11 +1183,6 @@ SELECT
         ELSE 9
     END AS holiday_proximity_sort_key,
 
-    -- Metadata columns
-    base.dw_created_ts,
-    base.dw_source_system,
-    base.dw_version_desc,
-
     -- Calculate Relative Time Period Flags Dynamically
     CASE WHEN base.date = cv.current_date_val THEN 1 ELSE 0 END AS is_current_date,
     CASE WHEN base.year_month_key = TO_NUMBER(TO_CHAR(cv.current_date_val, 'YYYYMM')) THEN 1 ELSE 0 END AS is_current_month,
@@ -893,5 +1208,3 @@ CROSS JOIN current_values cv;
 COMMENT ON VIEW SPG_DAP01.PBI.BUSINESS_CALENDAR IS 'View providing a comprehensive calendar dimension by combining the static BUSINESS_CALENDAR_BASE table with dynamically calculated relative time period flags (e.g., is_current_month, is_last_7_days) and sort order columns for BI tools. Use this view for all reporting and analysis. Relative flags are always up-to-date based on CURRENT_DATE() at query time. Includes jurisdiction-specific holiday flags for all Australian states and territories.';
 
 END;
-
-
