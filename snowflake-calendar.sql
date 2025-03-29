@@ -1,15 +1,4 @@
-
--- STEP 0: Create the Table to Store the Public Holidays
-
-CREATE OR REPLACE TABLE SPG_DAP01.PBI.AUPUBLICHOLIDAYS (
-    date DATE,
-    holiday_name VARCHAR(255),
-    state VARCHAR(50)  -- e.g., 'National', 'VIC', 'NSW'
-);
-
--- STEP 1: Create the Table to Store the Business Calendar
-
-CREATE OR REPLACE PROCEDURE SPG_DAP01.PBI.BUILD_BUSINESS_CALENDAR_SP()
+CREATE OR REPLACE PROCEDURE SPG_DAP01.PBI.SP_BUILD_BUSINESS_CALENDAR()
 RETURNS VARCHAR
 LANGUAGE SQL
 AS
@@ -18,8 +7,6 @@ DECLARE
     status_message VARCHAR DEFAULT 'SUCCESS';
     current_run_ts TIMESTAMP_LTZ(9) := CURRENT_TIMESTAMP();
 BEGIN
-    ALTER SESSION SET TIMEZONE = 'Australia/Adelaide';
-
     CREATE OR REPLACE TABLE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE
     AS
     WITH date_generator AS (
@@ -29,12 +16,52 @@ BEGIN
         FROM date_generator
         WHERE calendar_date < '2035-12-31'
     ),
+    -- Pivot holidays by jurisdiction to avoid duplication
+    holiday_by_jurisdiction AS (
+        SELECT
+            h.DATE,
+            MAX(CASE WHEN UPPER(h.STATE) = 'NSW' THEN 1 ELSE 0 END) AS is_holiday_nsw,
+            MAX(CASE WHEN UPPER(h.STATE) = 'VIC' THEN 1 ELSE 0 END) AS is_holiday_vic,
+            MAX(CASE WHEN UPPER(h.STATE) = 'QLD' THEN 1 ELSE 0 END) AS is_holiday_qld,
+            MAX(CASE WHEN UPPER(h.STATE) = 'SA' THEN 1 ELSE 0 END) AS is_holiday_sa,
+            MAX(CASE WHEN UPPER(h.STATE) = 'WA' THEN 1 ELSE 0 END) AS is_holiday_wa,
+            MAX(CASE WHEN UPPER(h.STATE) = 'TAS' THEN 1 ELSE 0 END) AS is_holiday_tas,
+            MAX(CASE WHEN UPPER(h.STATE) = 'ACT' THEN 1 ELSE 0 END) AS is_holiday_act,
+            MAX(CASE WHEN UPPER(h.STATE) = 'NT' THEN 1 ELSE 0 END) AS is_holiday_nt,
+            CASE 
+                -- If already marked as NATIONAL in the data
+                WHEN MAX(CASE WHEN UPPER(STATE) = 'NATIONAL' THEN 1 ELSE 0 END) = 1 THEN 1
+                -- If all states/territories have the same holiday
+                WHEN MIN(CASE 
+                        WHEN UPPER(STATE) IN ('NSW', 'VIC', 'QLD', 'SA', 'WA', 'TAS', 'ACT', 'NT') THEN 1 
+                        ELSE 0 
+                        END) = 1 
+                AND COUNT(DISTINCT UPPER(STATE)) >= 8 THEN 1
+                ELSE 0
+            END AS is_holiday_national,
+            -- Combine holiday names with states in parentheses
+            LISTAGG(DISTINCT HOLIDAY_NAME || ' (' || STATE || ')', '; ')  AS holiday_names
+        FROM SPG_DAP01.PBI.AU_PUBLIC_HOLIDAYS_VW h
+        GROUP BY h.DATE
+    ),
+    -- Modified to use pivoted holiday data
     date_generator_with_holidays AS (
         SELECT
             dg.calendar_date,
-            h.DATE IS NOT NULL AS is_holiday_flag
+            COALESCE(h.is_holiday_nsw, 0) AS is_holiday_nsw,
+            COALESCE(h.is_holiday_vic, 0) AS is_holiday_vic,
+            COALESCE(h.is_holiday_qld, 0) AS is_holiday_qld,
+            COALESCE(h.is_holiday_sa, 0) AS is_holiday_sa,
+            COALESCE(h.is_holiday_wa, 0) AS is_holiday_wa,
+            COALESCE(h.is_holiday_tas, 0) AS is_holiday_tas,
+            COALESCE(h.is_holiday_act, 0) AS is_holiday_act,
+            COALESCE(h.is_holiday_nt, 0) AS is_holiday_nt,
+            COALESCE(h.is_holiday_national, 0) AS is_holiday_national,
+            h.holiday_names,
+            -- A date is a holiday if it's a holiday in any jurisdiction
+            CASE WHEN h.DATE IS NOT NULL THEN 1 ELSE 0 END AS is_holiday_flag
         FROM date_generator dg
-        LEFT JOIN AUPUBLICHOLIDAYS h ON dg.calendar_date = h.DATE
+        LEFT JOIN holiday_by_jurisdiction h ON dg.calendar_date = h.DATE
     ),
     base_calendar AS (
         SELECT
@@ -89,8 +116,21 @@ BEGIN
             CEIL((DATEDIFF(DAY, DATE_TRUNC('QUARTER', dgh.calendar_date), dgh.calendar_date) + 1) / 7.0) AS week_of_quarter_num,
             CASE WHEN DAYOFWEEKISO(dgh.calendar_date) IN (6, 7) THEN 0 ELSE 1 END AS is_weekday, -- ISO Weekday 1-5
             CASE WHEN DAYOFWEEKISO(dgh.calendar_date) IN (6, 7) THEN 'Weekend' ELSE 'Weekday' END AS weekday_indicator, -- ISO Weekend 6,7
-            CASE WHEN dgh.is_holiday_flag THEN 1 ELSE 0 END        AS is_holiday,
-            CASE WHEN dgh.is_holiday_flag THEN 'Holiday' ELSE 'Non-Holiday' END AS holiday_indicator,
+            dgh.is_holiday_flag AS is_holiday,
+            CASE WHEN dgh.is_holiday_flag = 1 THEN 'Holiday' ELSE 'Non-Holiday' END AS holiday_indicator,
+            dgh.holiday_names AS holiday_desc,
+
+            -- Add separate columns for each jurisdiction
+            dgh.is_holiday_nsw,
+            dgh.is_holiday_vic,
+            dgh.is_holiday_qld,
+            dgh.is_holiday_sa,
+            dgh.is_holiday_wa,
+            dgh.is_holiday_tas,
+            dgh.is_holiday_act,
+            dgh.is_holiday_nt,
+            dgh.is_holiday_national,
+
             DATEADD(YEAR, -1, dgh.calendar_date)                   AS same_date_last_year
         FROM date_generator_with_holidays dgh
     ),
@@ -104,6 +144,10 @@ BEGIN
             END AS is_f445_soy_marker -- Corrected Logic
         FROM base_calendar
     ),
+
+    -- Rest of the procedure remains unchanged
+    -- Continuing from the existing code...
+
     f445_years AS (
         SELECT
             date AS f445_soy_date,
@@ -204,25 +248,29 @@ BEGIN
     /* Trading Day Calendar */
     trading_day_calendar AS (
         SELECT
-            f445d.date,
+            f445d.*,
             CASE WHEN f445d.is_weekday = 1 AND f445d.is_holiday = 0 THEN 1 ELSE 0 END AS is_trading_day,
-            CASE WHEN f445d.is_weekday = 0 THEN 'Weekend' WHEN f445d.is_holiday = 1 THEN 'Holiday' ELSE 'Trading Day' END AS trading_day_desc,
+            CASE
+                WHEN f445d.is_weekday = 0 THEN 'Weekend'
+                WHEN f445d.is_holiday = 1 THEN 'Holiday'
+                ELSE 'Trading Day'
+            END AS trading_day_desc,
             ROW_NUMBER() OVER (PARTITION BY f445d.year_month_key ORDER BY f445d.date) AS day_of_month_seq,
-            SUM(is_trading_day) OVER (PARTITION BY f445d.year_month_key ORDER BY f445d.date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS trading_day_of_month_seq,
+            SUM(CASE WHEN f445d.is_weekday = 1 AND f445d.is_holiday = 0 THEN 1 ELSE 0 END) OVER (PARTITION BY f445d.year_month_key ORDER BY f445d.date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS trading_day_of_month_seq,
             CASE WHEN f445d.date = f445d.month_start_date THEN 1 ELSE 0 END AS is_first_day_of_month,
             CASE WHEN f445d.date = f445d.month_end_date THEN 1 ELSE 0 END AS is_last_day_of_month,
             CASE WHEN f445d.date = f445d.quarter_start_date THEN 1 ELSE 0 END AS is_first_day_of_quarter,
             CASE WHEN f445d.date = f445d.quarter_end_date THEN 1 ELSE 0 END AS is_last_day_of_quarter,
             LEAD(f445d.date) OVER (ORDER BY f445d.date) AS next_date,
             LAG(f445d.date) OVER (ORDER BY f445d.date) AS previous_date,
-            LAG(CASE WHEN is_trading_day = 1 THEN f445d.date END IGNORE NULLS) OVER (ORDER BY f445d.date) AS previous_trading_date,
-            LEAD(CASE WHEN is_trading_day = 1 THEN f445d.date END IGNORE NULLS) OVER (ORDER BY f445d.date) AS next_trading_date,
-            SUM(is_trading_day) OVER (PARTITION BY f445d.year_month_key) AS trading_days_in_month,
-            SUM(is_trading_day) OVER (PARTITION BY f445d.year_quarter_key) AS trading_days_in_quarter,
-            SUM(is_trading_day) OVER (PARTITION BY f445d.au_fiscal_month_year_key) AS trading_days_in_au_fiscal_month,
-            SUM(is_trading_day) OVER (PARTITION BY f445d.au_fiscal_quarter_year_key) AS trading_days_in_au_fiscal_quarter,
-            SUM(is_trading_day) OVER (PARTITION BY f445d.f445_year_month_key) AS trading_days_in_f445_period,
-            SUM(is_trading_day) OVER (PARTITION BY f445d.f445_quarter_year_key) AS trading_days_in_f445_quarter
+            LAG(CASE WHEN f445d.is_weekday = 1 AND f445d.is_holiday = 0 THEN f445d.date END) OVER (ORDER BY f445d.date) AS previous_trading_date,
+            LEAD(CASE WHEN f445d.is_weekday = 1 AND f445d.is_holiday = 0 THEN f445d.date END) OVER (ORDER BY f445d.date) AS next_trading_date,
+            SUM(CASE WHEN f445d.is_weekday = 1 AND f445d.is_holiday = 0 THEN 1 ELSE 0 END) OVER (PARTITION BY f445d.year_month_key) AS trading_days_in_month,
+            SUM(CASE WHEN f445d.is_weekday = 1 AND f445d.is_holiday = 0 THEN 1 ELSE 0 END) OVER (PARTITION BY f445d.year_quarter_key) AS trading_days_in_quarter,
+            SUM(CASE WHEN f445d.is_weekday = 1 AND f445d.is_holiday = 0 THEN 1 ELSE 0 END) OVER (PARTITION BY f445d.au_fiscal_month_year_key) AS trading_days_in_au_fiscal_month,
+            SUM(CASE WHEN f445d.is_weekday = 1 AND f445d.is_holiday = 0 THEN 1 ELSE 0 END) OVER (PARTITION BY f445d.au_fiscal_quarter_year_key) AS trading_days_in_au_fiscal_quarter,
+            SUM(CASE WHEN f445d.is_weekday = 1 AND f445d.is_holiday = 0 THEN 1 ELSE 0 END) OVER (PARTITION BY f445d.f445_year_month_key) AS trading_days_in_f445_period,
+            SUM(CASE WHEN f445d.is_weekday = 1 AND f445d.is_holiday = 0 THEN 1 ELSE 0 END) OVER (PARTITION BY f445d.f445_quarter_year_key) AS trading_days_in_f445_quarter
         FROM f445_detail f445d
     ),
     /* Good Fridays */
@@ -252,7 +300,7 @@ BEGIN
         LEFT JOIN good_fridays gf ON f445d.year_num = gf.year_num
     ),
     /* Final Calendar Build - WITHOUT RELATIVE TIME FLAGS */
-    final_calendar_build AS (
+       final_calendar_build AS (
         SELECT
             f445d.*,
             ly_map.date AS same_business_day_last_year,
@@ -264,8 +312,8 @@ BEGIN
             tdc.trading_days_in_f445_period, tdc.trading_days_in_f445_quarter,
             rs.retail_season, rs.holiday_proximity,
             :current_run_ts AS dw_created_ts,
-            'BUILD_BUSINESS_CALENDAR_SP' AS dw_source_system,
-            'v1.3 - F445 Mon Start, No Relative Flags' AS dw_version_desc
+            'SP_BUILD_BUSINESS_CALENDAR' AS dw_source_system,
+            'v1.5 - Added per-jurisdiction holiday flags' AS dw_version_desc
         FROM f445_detail f445d
         LEFT JOIN f445_detail ly_map
             ON ly_map.au_fiscal_year_num = f445d.au_fiscal_year_num - 1
@@ -276,12 +324,26 @@ BEGIN
     )
     SELECT * FROM final_calendar_build ORDER BY date;
 
-    -- Clustering on the base table
-    ALTER TABLE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE CLUSTER BY (date);
+    RETURN status_message;
 
-    -- Add comments
-    COMMENT ON TABLE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE IS
-    'Base calendar dimension table generated by BUILD_BUSINESS_CALENDAR_SP procedure.
+EXCEPTION
+    WHEN OTHER THEN
+        status_message := 'ERROR: ' || SQLERRM;
+        RETURN status_message;
+END
+$$;
+
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- Step 7: Call stored procedure to build the Business Calendar
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+CALL SPG_DAP01.PBI.SP_BUILD_BUSINESS_CALENDAR();
+
+-- Clustering on the base table
+ALTER TABLE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE CLUSTER BY (date);
+
+-- Add comments
+COMMENT ON TABLE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE IS
+  'Base calendar dimension table generated by BUILD_BUSINESS_CALENDAR_SP procedure.
 Contains static attributes for Gregorian, AU Fiscal (July-June), and Retail 4-4-5 (starting first Monday of July) calendars.
 Relative time period flags (e.g., is_current_month) are calculated dynamically in the BUSINESS_CALENDAR view.
 
@@ -294,286 +356,345 @@ Key features:
    - same_business_day_last_year: Same fiscal week and weekday from previous year.
 5. Trading day indicators and counts.
 6. Retail seasons.
+7. Holiday flags for each Australian jurisdiction (NSW, VIC, QLD, SA, WA, TAS, ACT, NT, National).
+8. Holiday description column that combines holiday names with relevant jurisdictions.
 
 Update Frequency: Infrequent (e.g., yearly) or when holiday/fiscal structure changes.
 Query Interface: Use the BUSINESS_CALENDAR view for analysis.
-Version: v1.3';
+Version: v1.5';
 
-    -- Core Date Columns
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.date IS 'Primary key. The specific calendar date (YYYY-MM-DD).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.date_key IS 'Integer representation of the date (YYYYMMDD). Useful for joining or partitioning.';
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------    
+-- Step 8: Create the View with Dynamic Relative Time Flags and inline column comments
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+BEGIN
+CREATE OR REPLACE VIEW SPG_DAP01.PBI.BUSINESS_CALENDAR (
+    -- Basic columns
+    date COMMENT 'Primary key. The specific calendar date (YYYY-MM-DD).',
+    date_key COMMENT 'Integer representation of the date (YYYYMMDD). Useful for joining or partitioning.',
+    year_num COMMENT 'Calendar year number (e.g., 2024).',
+    year_desc COMMENT 'Calendar year description (e.g., CY24).',
+    quarter_num COMMENT 'Calendar quarter number (1-4).',
+    quarter_desc COMMENT 'Calendar quarter description (e.g., Q1).',
+    year_quarter_key COMMENT 'Integer key for calendar year and quarter (YYYYQ).',
+    quarter_sort_key COMMENT 'Sort key for quarters (1-4) that ensures proper ordering in BI tools.',
+    month_num COMMENT 'Calendar month number (1-12).',
+    month_short_name COMMENT 'Abbreviated calendar month name (e.g., Jan).',
+    month_long_name COMMENT 'Full calendar month name (e.g., January).',
+    year_month_key COMMENT 'Integer key for calendar year and month (YYYYMM).',
+    month_year_desc COMMENT 'Calendar month and year description (e.g., Jan 2024).',
+    month_sort_key COMMENT 'Sort key for months (1-12) that ensures proper ordering in BI tools.',
+    week_of_year_num COMMENT 'Week number within the calendar year (behavior depends on WEEK_START session parameter).',
+    year_of_week_num COMMENT 'Year number associated with week_of_year_num (depends on WEEK_START).',
+    year_week_desc COMMENT 'Year and week description (depends on WEEK_START).',
+    week_sort_key COMMENT 'Sort key for weeks that ensures proper ordering by week number in BI tools.',
+    iso_week_num COMMENT 'ISO 8601 week number within the ISO year (Week starts Monday).',
+    iso_year_of_week_num COMMENT 'ISO 8601 year number associated with the ISO week.',
+    iso_year_week_desc COMMENT 'ISO 8601 year and week description.',
+    day_of_month_num COMMENT 'Day number within the calendar month (1-31).',
+    day_of_week_num COMMENT 'Day number within the week (0=Sunday, 1=Monday, ..., 6=Saturday). Behavior depends on WEEK_START session parameter.',
+    iso_day_of_week_num COMMENT 'ISO 8601 day number within the week (1=Monday, ..., 7=Sunday).',
+    day_of_year_num COMMENT 'Day number within the calendar year (1-366).',
+    day_short_name COMMENT 'Abbreviated day name (e.g., Mon).',
+    day_long_name COMMENT 'Full day name (e.g., Monday).',
+    day_of_week_sort_key COMMENT 'Sort key for days of week that ensures proper ordering (1-7, where 1=Monday following ISO standard).',
+    date_full_desc COMMENT 'Full date description (e.g., 27 Mar 2024).',
+    date_formatted COMMENT 'Date formatted as DD/MM/YYYY.',
+    month_start_date COMMENT 'First day of the calendar month.',
+    month_end_date COMMENT 'Last day of the calendar month.',
+    quarter_start_date COMMENT 'First day of the calendar quarter.',
+    quarter_end_date COMMENT 'Last day of the calendar quarter.',
+    year_start_date COMMENT 'First day of the calendar year.',
+    year_end_date COMMENT 'Last day of the calendar year.',
+    week_start_date COMMENT 'First day of the week (behavior depends on WEEK_START session parameter).',
+    week_end_date COMMENT 'Last day of the week (behavior depends on WEEK_START session parameter).',
+    day_of_month_count COMMENT 'Sequential day number within the calendar month (1 to N).',
+    days_in_month_count COMMENT 'Total number of days in the calendar month.',
+    day_of_quarter_count COMMENT 'Sequential day number within the calendar quarter (1 to N).',
+    days_in_quarter_count COMMENT 'Total number of days in the calendar quarter.',
+    week_of_month_num COMMENT 'Week number within the calendar month (1-6). Calculated as CEIL(day_of_month_num / 7.0).',
+    week_of_quarter_num COMMENT 'Week number within the calendar quarter (1-14). Calculated as CEIL(day_of_quarter_count / 7.0).',
 
-    -- Standard Calendar Columns
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.year_num IS 'Calendar year number (e.g., 2024).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.year_desc IS 'Calendar year description (e.g., CY24).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.quarter_num IS 'Calendar quarter number (1-4).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.quarter_desc IS 'Calendar quarter description (e.g., Q1).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.year_quarter_key IS 'Integer key for calendar year and quarter (YYYYQ).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.month_num IS 'Calendar month number (1-12).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.month_short_name IS 'Abbreviated calendar month name (e.g., Jan).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.month_long_name IS 'Full calendar month name (e.g., January).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.year_month_key IS 'Integer key for calendar year and month (YYYYMM).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.month_year_desc IS 'Calendar month and year description (e.g., Jan 2024).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.week_of_year_num IS 'Week number within the calendar year (behavior depends on WEEK_START session parameter).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.iso_week_num IS 'ISO 8601 week number within the ISO year (Week starts Monday).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.iso_year_of_week_num IS 'ISO 8601 year number associated with the ISO week.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.day_of_month_num IS 'Day number within the calendar month (1-31).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.day_of_week_num IS 'Day number within the week (0=Sunday, 1=Monday, ..., 6=Saturday). Behavior depends on WEEK_START session parameter.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.iso_day_of_week_num IS 'ISO 8601 day number within the week (1=Monday, ..., 7=Sunday).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.day_of_year_num IS 'Day number within the calendar year (1-366).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.day_short_name IS 'Abbreviated day name (e.g., Mon).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.day_long_name IS 'Full day name (e.g., Monday).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.date_full_desc IS 'Full date description (e.g., 27 Mar 2024).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.date_formatted IS 'Date formatted as DD/MM/YYYY.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.month_start_date IS 'First day of the calendar month.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.month_end_date IS 'Last day of the calendar month.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.quarter_start_date IS 'First day of the calendar quarter.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.quarter_end_date IS 'Last day of the calendar quarter.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.year_start_date IS 'First day of the calendar year.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.year_end_date IS 'Last day of the calendar year.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.week_start_date IS 'First day of the week (behavior depends on WEEK_START session parameter).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.week_end_date IS 'Last day of the week (behavior depends on WEEK_START session parameter).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.day_of_month_count IS 'Sequential day number within the calendar month (1 to N).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.days_in_month_count IS 'Total number of days in the calendar month.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.day_of_quarter_count IS 'Sequential day number within the calendar quarter (1 to N).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.days_in_quarter_count IS 'Total number of days in the calendar quarter.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.week_of_month_num IS 'Week number within the calendar month (1-6). Calculated as CEIL(day_of_month_num / 7.0).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.week_of_quarter_num IS 'Week number within the calendar quarter (1-14). Calculated as CEIL(day_of_quarter_count / 7.0).';
+    -- Business indicator columns
+    is_weekday COMMENT 'Indicator (1/0) if the day is a weekday (Monday-Friday based on day_of_week_num).',
+    weekday_indicator COMMENT 'Description (Weekday/Weekend) based on is_weekday.',
+    is_holiday COMMENT 'Indicator (1/0) if the day exists in the AU_PUBLIC_HOLIDAYS table for any jurisdiction.',
+    holiday_indicator COMMENT 'Description (Holiday/Non-Holiday) based on is_holiday.',
+    holiday_desc COMMENT 'Combined holiday names and jurisdictions for this date, if a holiday.',
 
-    -- Business Indicator Columns
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_weekday IS 'Indicator (1/0) if the day is a weekday (Monday-Friday based on day_of_week_num).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.weekday_indicator IS 'Description (Weekday/Weekend) based on is_weekday.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_holiday IS 'Indicator (1/0) if the day exists in the AUPUBLICHOLIDAYS table.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.holiday_indicator IS 'Description (Holiday/Non-Holiday) based on is_holiday.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_trading_day IS 'Indicator (1/0) if the day is a weekday AND not a holiday. Useful for business day calculations.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.trading_day_desc IS 'Description (Trading Day/Weekend/Holiday) based on is_trading_day logic.';
+    -- Jurisdiction-specific holiday flags
+    is_holiday_nsw COMMENT 'Indicator (1/0) if the day is a holiday in New South Wales.',
+    is_holiday_vic COMMENT 'Indicator (1/0) if the day is a holiday in Victoria.',
+    is_holiday_qld COMMENT 'Indicator (1/0) if the day is a holiday in Queensland.',
+    is_holiday_sa COMMENT 'Indicator (1/0) if the day is a holiday in South Australia.',
+    is_holiday_wa COMMENT 'Indicator (1/0) if the day is a holiday in Western Australia.',
+    is_holiday_tas COMMENT 'Indicator (1/0) if the day is a holiday in Tasmania.',
+    is_holiday_act COMMENT 'Indicator (1/0) if the day is a holiday in Australian Capital Territory.',
+    is_holiday_nt COMMENT 'Indicator (1/0) if the day is a holiday in Northern Territory.',
+    is_holiday_national COMMENT 'Indicator (1/0) if the day is a national holiday in Australia.',
 
-    -- YoY Comparison Columns
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.same_date_last_year IS 'The exact same calendar date from the previous year (e.g., 2023-03-15 for 2024-03-15). Properly handles leap years. Use for strict date-based comparisons (e.g., financial month-end).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.same_business_day_last_year IS 'The equivalent business day from the previous AU fiscal year, matching AU fiscal week number and ISO day of week number. Use for business performance comparisons where week alignment matters (e.g., retail sales). May not be the same calendar date.';
+    is_trading_day COMMENT 'Indicator (1/0) if the day is a weekday AND not a holiday. Useful for business day calculations.',
+    trading_day_desc COMMENT 'Description (Trading Day/Weekend/Holiday) based on is_trading_day logic.',
 
-    -- Australian Fiscal Calendar Columns
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_year_num IS 'Australian Financial Year number (July 1 - June 30), designated by the calendar year it ends in (e.g., FY24 = Jul 2023 - Jun 2024).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_year_desc IS 'Australian Financial Year description (e.g., FY24).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_quarter_num IS 'Quarter number within the Australian Fiscal Year (1-4, where Q1 = Jul-Sep).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_quarter_desc IS 'Australian Fiscal Quarter description (e.g., QTR 1).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_quarter_year_key IS 'Integer key for AU fiscal year and quarter (YYYYQ, where YYYY is fiscal year number).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_month_num IS 'Month number within the Australian Fiscal Year (1-12, where 1 = July).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_month_desc IS 'Australian Fiscal Month description (e.g., Month 01 for July).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_month_year_key IS 'Integer key for AU fiscal year and month number (YYYYMM, where YYYY is fiscal year number, MM is fiscal month 1-12).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_week_num IS 'Sequential week number within the Australian Fiscal Year (starting from 1). Simple calculation based on days since FY start.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_start_date_for_year IS 'Start date (July 1) of the AU Fiscal Year this date belongs to.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_end_date_for_year IS 'End date (June 30) of the AU Fiscal Year this date belongs to.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_quarter_start_date IS 'Start date of the AU Fiscal Quarter this date belongs to.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_quarter_end_date IS 'End date of the AU Fiscal Quarter this date belongs to.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_month_start_date IS 'Start date of the AU Fiscal Month (within the fiscal year) this date belongs to.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_month_end_date IS 'End date of the AU Fiscal Month (within the fiscal year) this date belongs to.';
+    -- YoY comparison columns
+    same_date_last_year COMMENT 'The exact same calendar date from the previous year (e.g., 2023-03-15 for 2024-03-15). Properly handles leap years. Use for strict date-based comparisons (e.g., financial month-end).',
+    same_business_day_last_year COMMENT 'The equivalent business day from the previous AU fiscal year, matching AU fiscal week number and ISO day of week number. Use for business performance comparisons where week alignment matters (e.g., retail sales). May not be the same calendar date.',
 
-    -- Retail 4-4-5 Calendar Columns
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_year_num IS 'Retail 4-4-5 Year number, designated by the calendar year it ends in (assumption: starts first Sunday of July).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_year_desc IS 'Retail 4-4-5 Year description (e.g., F24).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_half_num IS 'Half number within the Retail 4-4-5 Year (1 or 2).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_half_desc IS 'Retail 4-4-5 Half description (e.g., HALF 1).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_quarter_num IS 'Quarter number within the Retail 4-4-5 Year (1-4), based on 4-4-5 period groupings.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_quarter_desc IS 'Retail 4-4-5 Quarter description (e.g., QTR 1).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_quarter_year_key IS 'Integer key for F445 year and quarter (YYYYQ, where YYYY is F445 year number).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_period_num IS 'Period number (month equivalent) within the Retail 4-4-5 Year (1-12), following a 4-4-5 week pattern.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_period_desc IS 'Retail 4-4-5 Period description (e.g., MONTH 1).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_year_month_key IS 'Integer key for F445 year and period number (YYYYPP, where YYYY is F445 year number, PP is period 1-12).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_month_short_name IS 'Equivalent calendar month name (approx) for the F445 period (e.g., Jul for Period 1).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_month_long_name IS 'Full equivalent calendar month name (approx) for the F445 period (e.g., July for Period 1).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_month_year_desc IS 'F445 equivalent month and year description (e.g., Jul F24).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_month_full_year_desc IS 'F445 equivalent full month and year description (e.g., July F24).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_week_num IS 'Sequential week number within the Retail 4-4-5 Year (starting from 1).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_start_of_year IS 'Start date of the F445 Year this date belongs to (assumed first Sunday of July).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_end_of_year IS 'End date of the F445 Year this date belongs to (calculated).';
+    -- Australian fiscal calendar columns
+    au_fiscal_year_num COMMENT 'Australian Financial Year number (July 1 - June 30), designated by the calendar year it ends in (e.g., FY24 = Jul 2023 - Jun 2024).',
+    au_fiscal_year_desc COMMENT 'Australian Financial Year description (e.g., FY24).',
+    au_fiscal_quarter_num COMMENT 'Quarter number within the Australian Fiscal Year (1-4, where Q1 = Jul-Sep).',
+    au_fiscal_quarter_desc COMMENT 'Australian Fiscal Quarter description (e.g., QTR 1).',
+    au_fiscal_quarter_year_key COMMENT 'Integer key for AU fiscal year and quarter (YYYYQ, where YYYY is fiscal year number).',
+    au_fiscal_quarter_sort_key COMMENT 'Sort key for AU fiscal quarters (1-4) that ensures proper ordering in BI tools.',
+    au_fiscal_month_num COMMENT 'Month number within the Australian Fiscal Year (1-12, where 1 = July).',
+    au_fiscal_month_desc COMMENT 'Australian Fiscal Month description (e.g., Month 01 for July).',
+    au_fiscal_month_year_key COMMENT 'Integer key for AU fiscal year and month number (YYYYMM, where YYYY is fiscal year number, MM is fiscal month 1-12).',
+    au_fiscal_month_sort_key COMMENT 'Sort key for AU fiscal months (1-12) that ensures proper ordering in BI tools.',
+    au_fiscal_week_num COMMENT 'Sequential week number within the Australian Fiscal Year (starting from 1). Simple calculation based on days since FY start.',
+    au_fiscal_start_date_for_year COMMENT 'Start date (July 1) of the AU Fiscal Year this date belongs to.',
+    au_fiscal_end_date_for_year COMMENT 'End date (June 30) of the AU Fiscal Year this date belongs to.',
+    au_fiscal_quarter_start_date COMMENT 'Start date of the AU Fiscal Quarter this date belongs to.',
+    au_fiscal_quarter_end_date COMMENT 'End date of the AU Fiscal Quarter this date belongs to.',
+    au_fiscal_month_start_date COMMENT 'Start date of the AU Fiscal Month (within the fiscal year) this date belongs to.',
+    au_fiscal_month_end_date COMMENT 'End date of the AU Fiscal Month (within the fiscal year) this date belongs to.',
 
-    -- Trading Day Sequence & Count Columns
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.day_of_month_seq IS 'Sequential number for all days within the calendar month (1 to N).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.trading_day_of_month_seq IS 'Sequential number for trading days only within the calendar month (1 to M, where M <= N).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_first_day_of_month IS 'Indicator (1/0) if this is the first calendar day of the month.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_last_day_of_month IS 'Indicator (1/0) if this is the last calendar day of the month.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_first_day_of_quarter IS 'Indicator (1/0) if this is the first calendar day of the quarter.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_last_day_of_quarter IS 'Indicator (1/0) if this is the last calendar day of the quarter.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.next_date IS 'The next calendar date.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.previous_date IS 'The previous calendar date.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.next_trading_date IS 'The next trading date (skips weekends/holidays).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.previous_trading_date IS 'The previous trading date (skips weekends/holidays).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.trading_days_in_month IS 'Total count of trading days in the calendar month.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.trading_days_in_quarter IS 'Total count of trading days in the calendar quarter.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.trading_days_in_au_fiscal_month IS 'Total count of trading days in the AU Fiscal Month.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.trading_days_in_au_fiscal_quarter IS 'Total count of trading days in the AU Fiscal Quarter.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.trading_days_in_f445_period IS 'Total count of trading days in the F445 Period.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.trading_days_in_f445_quarter IS 'Total count of trading days in the F445 Quarter.';
+    -- Retail 4-4-5 calendar columns
+    f445_year_num COMMENT 'Retail 4-4-5 Year number, designated by the calendar year it ends in (assumption: starts first Monday of July).',
+    f445_year_desc COMMENT 'Retail 4-4-5 Year description (e.g., F24).',
+    f445_half_num COMMENT 'Half number within the Retail 4-4-5 Year (1 or 2).',
+    f445_half_desc COMMENT 'Retail 4-4-5 Half description (e.g., HALF 1).',
+    f445_half_sort_key COMMENT 'Sort key for F445 half-years (1-2) that ensures proper ordering in BI tools.',
+    f445_quarter_num COMMENT 'Quarter number within the Retail 4-4-5 Year (1-4), based on 4-4-5 period groupings.',
+    f445_quarter_desc COMMENT 'Retail 4-4-5 Quarter description (e.g., QTR 1).',
+    f445_quarter_year_key COMMENT 'Integer key for F445 year and quarter (YYYYQ, where YYYY is F445 year number).',
+    f445_quarter_sort_key COMMENT 'Sort key for F445 quarters (1-4) that ensures proper ordering in BI tools.',
+    f445_period_num COMMENT 'Period number (month equivalent) within the Retail 4-4-5 Year (1-12), following a 4-4-5 week pattern.',
+    f445_period_desc COMMENT 'Retail 4-4-5 Period description (e.g., MONTH 1).',
+    f445_year_month_key COMMENT 'Integer key for F445 year and period number (YYYYPP, where YYYY is F445 year number, PP is period 1-12).',
+    f445_period_sort_key COMMENT 'Sort key for F445 periods (1-12) that ensures proper ordering in BI tools.',
+    f445_month_short_name COMMENT 'Equivalent calendar month name (approx) for the F445 period (e.g., Jul for Period 1).',
+    f445_month_long_name COMMENT 'Full equivalent calendar month name (approx) for the F445 period (e.g., July for Period 1).',
+    f445_month_year_desc COMMENT 'F445 equivalent month and year description (e.g., Jul F24).',
+    f445_month_full_year_desc COMMENT 'F445 equivalent full month and year description (e.g., July F24).',
+    f445_week_num COMMENT 'Sequential week number within the Retail 4-4-5 Year (starting from 1).',
+    f445_week_sort_key COMMENT 'Sort key for F445 weeks that ensures proper ordering in BI tools.',
+    f445_start_of_year COMMENT 'Start date of the F445 Year this date belongs to (assumed first Monday of July).',
+    f445_end_of_year COMMENT 'End date of the F445 Year this date belongs to (calculated).',
 
-    -- Retail Season Columns
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.retail_season IS 'Categorizes dates into Australian retail seasons: \'Christmas Season\' (Nov 1 - Dec 24), \'Back to School\' (Jan 15 - Feb 15), \'Easter Season\' (3 weeks prior to Good Friday incl. Easter Monday), \'EOFY Sales\' (June), \'Regular Season\' (other).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.holiday_proximity IS 'Identifies specific periods near major holidays: \'Christmas Eve Period\' (Dec 20-24), \'Boxing Day\' (Dec 26), \'Post-Christmas Sale\' (Dec 27-31). NULL otherwise.';
+    -- Trading day sequence & count columns
+    day_of_month_seq COMMENT 'Sequential number for all days within the calendar month (1 to N).',
+    trading_day_of_month_seq COMMENT 'Sequential number for trading days only within the calendar month (1 to M, where M <= N).',
+    is_first_day_of_month COMMENT 'Indicator (1/0) if this is the first calendar day of the month.',
+    is_last_day_of_month COMMENT 'Indicator (1/0) if this is the last calendar day of the month.',
+    is_first_day_of_quarter COMMENT 'Indicator (1/0) if this is the first calendar day of the quarter.',
+    is_last_day_of_quarter COMMENT 'Indicator (1/0) if this is the last calendar day of the quarter.',
+    next_date COMMENT 'The next calendar date.',
+    previous_date COMMENT 'The previous calendar date.',
+    next_trading_date COMMENT 'The next trading date (skips weekends/holidays).',
+    previous_trading_date COMMENT 'The previous trading date (skips weekends/holidays).',
+    trading_days_in_month COMMENT 'Total count of trading days in the calendar month.',
+    trading_days_in_quarter COMMENT 'Total count of trading days in the calendar quarter.',
+    trading_days_in_au_fiscal_month COMMENT 'Total count of trading days in the AU Fiscal Month.',
+    trading_days_in_au_fiscal_quarter COMMENT 'Total count of trading days in the AU Fiscal Quarter.',
+    trading_days_in_f445_period COMMENT 'Total count of trading days in the F445 Period.',
+    trading_days_in_f445_quarter COMMENT 'Total count of trading days in the F445 Quarter.',
 
-    -- Metadata Columns
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.dw_created_ts IS 'Timestamp (LTZ) when the row/table was created or last updated by the procedure.';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.dw_source_system IS 'The name of the procedure that generated this data (BUILD_BUSINESS_CALENDAR_SP).';
-    COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.dw_version_desc IS 'Version description of the logic used to generate the data.';
+    -- Retail season columns
+    retail_season COMMENT 'Categorizes dates into Australian retail seasons: ''Christmas Season'' (Nov 1 - Dec 24), ''Back to School'' (Jan 15 - Feb 15), ''Easter Season'' (3 weeks prior to Good Friday incl. Easter Monday), ''EOFY Sales'' (June), ''Regular Season'' (other).',
+    retail_season_sort_key COMMENT 'Sort key for retail seasons to ensure proper ordering in BI tools.',
+    holiday_proximity COMMENT 'Identifies specific periods near major holidays: ''Christmas Eve Period'' (Dec 20-24), ''Boxing Day'' (Dec 26), ''Post-Christmas Sale'' (Dec 27-31). NULL otherwise.',
+    holiday_proximity_sort_key COMMENT 'Sort key for holiday proximity periods to ensure proper ordering in BI tools.',
 
-    RETURN status_message;
+    -- Metadata columns
+    dw_created_ts COMMENT 'Timestamp (LTZ) when the row/table was created or last updated by the procedure.',
+    dw_source_system COMMENT 'The name of the procedure that generated this data (BUILD_BUSINESS_CALENDAR_SP).',
+    dw_version_desc COMMENT 'Version description of the logic used to generate the data.',
 
-EXCEPTION
-    WHEN OTHER THEN
-        status_message := 'ERROR: ' || SQLERRM;
-        RETURN status_message;
-END
-$$;
-
-
--- STEP 2: Create the View with Dynamic Relative Time Flags
-
-CREATE OR REPLACE VIEW SPG_DAP01.PBI.BUSINESS_CALENDAR
-    (
-        -- List columns with CORRECTED comment syntax
-        -- Core Date Columns
-        date,
-        date_key,
-        -- Standard Calendar Columns
-        year_num,
-        year_desc,
-        quarter_num,
-        quarter_desc,
-        year_quarter_key,
-        month_num,
-        month_short_name,
-        month_long_name,
-        year_month_key,
-        month_year_desc,
-        week_of_year_num,
-        year_of_week_num,
-        year_week_desc,
-        iso_week_num,
-        iso_year_of_week_num,
-        iso_year_week_desc,
-        day_of_month_num,
-        day_of_week_num,
-        iso_day_of_week_num,
-        day_of_year_num,
-        day_short_name,
-        day_long_name,
-        date_full_desc,
-        date_formatted,
-        month_start_date,
-        month_end_date,
-        quarter_start_date,
-        quarter_end_date,
-        year_start_date,
-        year_end_date,
-        week_start_date,
-        week_end_date,
-        day_of_month_count,
-        days_in_month_count,
-        day_of_quarter_count,
-        days_in_quarter_count,
-        week_of_month_num,
-        week_of_quarter_num,
-        -- Business Indicator Columns
-        is_weekday,
-        weekday_indicator,
-        is_holiday,
-        holiday_indicator,
-        is_trading_day,
-        trading_day_desc,
-        -- YoY Comparison Columns
-        same_date_last_year,
-        same_business_day_last_year,
-        -- Australian Fiscal Calendar Columns
-        au_fiscal_year_num,
-        au_fiscal_year_desc,
-        au_fiscal_quarter_num,
-        au_fiscal_quarter_desc,
-        au_fiscal_quarter_year_key,
-        au_fiscal_month_num,
-        au_fiscal_month_desc,
-        au_fiscal_month_year_key,
-        au_fiscal_week_num,
-        au_fiscal_start_date_for_year,
-        au_fiscal_end_date_for_year,
-        au_fiscal_quarter_start_date,
-        au_fiscal_quarter_end_date,
-        au_fiscal_month_start_date,
-        au_fiscal_month_end_date,
-        -- Retail 4-4-5 Calendar Columns
-        f445_year_num,
-        f445_year_desc,
-        f445_half_num,
-        f445_half_desc,
-        f445_quarter_num,
-        f445_quarter_desc,
-        f445_quarter_year_key,
-        f445_period_num,
-        f445_period_desc,
-        f445_year_month_key,
-        f445_month_short_name,
-        f445_month_long_name,
-        f445_month_year_desc,
-        f445_month_full_year_desc,
-        f445_week_num,
-        f445_start_of_year,
-        f445_end_of_year,
-        -- Trading Day Sequence & Count Columns
-        day_of_month_seq,
-        trading_day_of_month_seq,
-        is_first_day_of_month,
-        is_last_day_of_month,
-        is_first_day_of_quarter,
-        is_last_day_of_quarter,
-        next_date,
-        previous_date,
-        next_trading_date,
-        previous_trading_date,
-        trading_days_in_month,
-        trading_days_in_quarter,
-        trading_days_in_au_fiscal_month,
-        trading_days_in_au_fiscal_quarter,
-        trading_days_in_f445_period,
-        trading_days_in_f445_quarter,
-        -- Retail Season Columns
-        retail_season,
-        holiday_proximity,
-        -- Metadata Columns
-        dw_created_ts,
-        dw_source_system,
-        dw_version_desc,
-        -- DYNAMIC RELATIVE TIME PERIOD FLAGS --
-        is_current_date,
-        is_current_month,
-        is_current_quarter,
-        is_current_year,
-        is_current_fiscal_year,
-        is_last_7_days,
-        is_last_30_days,
-        is_last_90_days,
-        is_previous_month,
-        is_previous_quarter,
-        is_rolling_12_months,
-        is_rolling_quarter,
-        is_year_to_date,
-        is_fiscal_year_to_date,
-        is_quarter_to_date,
-        is_month_to_date
-    )
+    -- Dynamic relative time flags
+    is_current_date COMMENT 'Indicator (1/0) if this date IS CURRENT_DATE(). Calculated dynamically.',
+    is_current_month COMMENT 'Indicator (1/0) if this date is in the same calendar month as CURRENT_DATE(). Calculated dynamically.',
+    is_current_quarter COMMENT 'Indicator (1/0) if this date is in the same calendar quarter as CURRENT_DATE(). Calculated dynamically.',
+    is_current_year COMMENT 'Indicator (1/0) if this date is in the same calendar year as CURRENT_DATE(). Calculated dynamically.',
+    is_current_fiscal_year COMMENT 'Indicator (1/0) if this date is in the same AU fiscal year as CURRENT_DATE(). Calculated dynamically.',
+    is_last_7_days COMMENT 'Indicator (1/0) if this date is within the 6 days prior to CURRENT_DATE() or is CURRENT_DATE(). Calculated dynamically.',
+    is_last_30_days COMMENT 'Indicator (1/0) if this date is within the 29 days prior to CURRENT_DATE() or is CURRENT_DATE(). Calculated dynamically.',
+    is_last_90_days COMMENT 'Indicator (1/0) if this date is within the 89 days prior to CURRENT_DATE() or is CURRENT_DATE(). Calculated dynamically.',
+    is_previous_month COMMENT 'Indicator (1/0) if this date is in the calendar month immediately preceding the month of CURRENT_DATE(). Calculated dynamically.',
+    is_previous_quarter COMMENT 'Indicator (1/0) if this date is in the calendar quarter immediately preceding the quarter of CURRENT_DATE(). Calculated dynamically.',
+    is_rolling_12_months COMMENT 'Indicator (1/0) if this date is within the 12 months preceding CURRENT_DATE() (inclusive). Calculated dynamically.',
+    is_rolling_quarter COMMENT 'Indicator (1/0) if this date is within the 3 months preceding CURRENT_DATE() (inclusive). Calculated dynamically.',
+    is_year_to_date COMMENT 'Indicator (1/0) if this date is within the current calendar year, up to and including CURRENT_DATE(). Calculated dynamically.',
+    is_fiscal_year_to_date COMMENT 'Indicator (1/0) if this date is within the current AU fiscal year, up to and including CURRENT_DATE(). Calculated dynamically.',
+    is_quarter_to_date COMMENT 'Indicator (1/0) if this date is within the current calendar quarter, up to and including CURRENT_DATE(). Calculated dynamically.',
+    is_month_to_date COMMENT 'Indicator (1/0) if this date is within the current calendar month, up to and including CURRENT_DATE(). Calculated dynamically.'
+)
 AS
 WITH current_values AS (
     -- Pre-calculate values based on CURRENT_DATE() once for efficiency in the view
     SELECT
         CURRENT_DATE() AS current_date_val,
-        DATE_TRUNC('MONTH', current_date_val) AS current_month_start,
-        DATE_TRUNC('QUARTER', current_date_val) AS current_quarter_start,
-        DATE_TRUNC('YEAR', current_date_val) AS current_year_start,
-        (SELECT MAX(b.year_month_key) FROM SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b WHERE b.date < current_month_start) AS prev_month_key,
-        (SELECT MAX(b.year_quarter_key) FROM SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b WHERE b.date < current_quarter_start) AS prev_quarter_key,
-        (SELECT b.au_fiscal_year_num FROM SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b WHERE b.date = current_date_val) AS current_au_fiscal_year_num,
-        (SELECT b.au_fiscal_start_date_for_year FROM SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b WHERE b.date = current_date_val) AS current_au_fiscal_start_date
+        DATE_TRUNC('MONTH', CURRENT_DATE()) AS current_month_start,
+        DATE_TRUNC('QUARTER', CURRENT_DATE()) AS current_quarter_start,
+        DATE_TRUNC('YEAR', CURRENT_DATE()) AS current_year_start,
+        (SELECT MAX(b.year_month_key) FROM SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b WHERE b.date < DATE_TRUNC('MONTH', CURRENT_DATE())) AS prev_month_key,
+        (SELECT MAX(b.year_quarter_key) FROM SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b WHERE b.date < DATE_TRUNC('QUARTER', CURRENT_DATE())) AS prev_quarter_key,
+        (SELECT b.au_fiscal_year_num FROM SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b WHERE b.date = CURRENT_DATE()) AS current_au_fiscal_year_num,
+        (SELECT b.au_fiscal_start_date_for_year FROM SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b WHERE b.date = CURRENT_DATE()) AS current_au_fiscal_start_date
 )
 SELECT
-    -- Select all columns from the base table
-    base.*,
+    -- Select columns from the base table
+    base.date,
+    base.date_key,
+    base.year_num,
+    base.year_desc,
+    base.quarter_num,
+    base.quarter_desc,
+    base.year_quarter_key,
+    base.quarter_num AS quarter_sort_key,
+    base.month_num,
+    base.month_short_name,
+    base.month_long_name,
+    base.year_month_key,
+    base.month_year_desc,
+    base.month_num AS month_sort_key,
+    base.week_of_year_num,
+    base.year_of_week_num,
+    base.year_week_desc,
+    base.year_of_week_num * 100 + base.week_of_year_num AS week_sort_key,
+    base.iso_week_num,
+    base.iso_year_of_week_num,
+    base.iso_year_week_desc,
+    base.day_of_month_num,
+    base.day_of_week_num,
+    base.iso_day_of_week_num,
+    base.day_of_year_num,
+    base.day_short_name,
+    base.day_long_name,
+    base.iso_day_of_week_num AS day_of_week_sort_key,
+    base.date_full_desc,
+    base.date_formatted,
+    base.month_start_date,
+    base.month_end_date,
+    base.quarter_start_date,
+    base.quarter_end_date,
+    base.year_start_date,
+    base.year_end_date,
+    base.week_start_date,
+    base.week_end_date,
+    base.day_of_month_count,
+    base.days_in_month_count,
+    base.day_of_quarter_count,
+    base.days_in_quarter_count,
+    base.week_of_month_num,
+    base.week_of_quarter_num,
+
+    -- Business indicator columns
+    base.is_weekday,
+    base.weekday_indicator,
+    base.is_holiday,
+    base.holiday_indicator,
+    base.holiday_desc,
+
+    -- Jurisdiction-specific holiday flags
+    base.is_holiday_nsw,
+    base.is_holiday_vic,
+    base.is_holiday_qld,
+    base.is_holiday_sa,
+    base.is_holiday_wa,
+    base.is_holiday_tas,
+    base.is_holiday_act,
+    base.is_holiday_nt,
+    base.is_holiday_national,
+
+    base.is_trading_day,
+    base.trading_day_desc,
+
+    -- YoY comparison columns
+    base.same_date_last_year,
+    base.same_business_day_last_year,
+
+    -- Australian fiscal calendar columns
+    base.au_fiscal_year_num,
+    base.au_fiscal_year_desc,
+    base.au_fiscal_quarter_num,
+    base.au_fiscal_quarter_desc,
+    base.au_fiscal_quarter_year_key,
+    base.au_fiscal_quarter_num AS au_fiscal_quarter_sort_key,
+    base.au_fiscal_month_num,
+    base.au_fiscal_month_desc,
+    base.au_fiscal_month_year_key,
+    base.au_fiscal_month_num AS au_fiscal_month_sort_key,
+    base.au_fiscal_week_num,
+    base.au_fiscal_start_date_for_year,
+    base.au_fiscal_end_date_for_year,
+    base.au_fiscal_quarter_start_date,
+    base.au_fiscal_quarter_end_date,
+    base.au_fiscal_month_start_date,
+    base.au_fiscal_month_end_date,
+
+    -- Retail 4-4-5 calendar columns
+    base.f445_year_num,
+    base.f445_year_desc,
+    base.f445_half_num,
+    base.f445_half_desc,
+    base.f445_half_num AS f445_half_sort_key,
+    base.f445_quarter_num,
+    base.f445_quarter_desc,
+    base.f445_quarter_year_key,
+    base.f445_quarter_num AS f445_quarter_sort_key,
+    base.f445_period_num,
+    base.f445_period_desc,
+    base.f445_year_month_key,
+    base.f445_period_num AS f445_period_sort_key,
+    base.f445_month_short_name,
+    base.f445_month_long_name,
+    base.f445_month_year_desc,
+    base.f445_month_full_year_desc,
+    base.f445_week_num,
+    base.f445_week_num AS f445_week_sort_key,
+    base.f445_start_of_year,
+    base.f445_end_of_year,
+
+    -- Trading day sequence & count columns
+    base.day_of_month_seq,
+    base.trading_day_of_month_seq,
+    base.is_first_day_of_month,
+    base.is_last_day_of_month,
+    base.is_first_day_of_quarter,
+    base.is_last_day_of_quarter,
+    base.next_date,
+    base.previous_date,
+    base.next_trading_date,
+    base.previous_trading_date,
+    base.trading_days_in_month,
+    base.trading_days_in_quarter,
+    base.trading_days_in_au_fiscal_month,
+    base.trading_days_in_au_fiscal_quarter,
+    base.trading_days_in_f445_period,
+    base.trading_days_in_f445_quarter,
+
+    -- Retail season columns with sort keys
+    base.retail_season,
+    CASE
+        WHEN base.retail_season = 'Christmas Season' THEN 1
+        WHEN base.retail_season = 'Back to School' THEN 2
+        WHEN base.retail_season = 'Easter Season' THEN 3
+        WHEN base.retail_season = 'EOFY Sales' THEN 4
+        WHEN base.retail_season = 'Regular Season' THEN 5
+        ELSE 9
+    END AS retail_season_sort_key,
+    base.holiday_proximity,
+    CASE
+        WHEN base.holiday_proximity = 'Christmas Eve Period' THEN 1
+        WHEN base.holiday_proximity = 'Boxing Day' THEN 2
+        WHEN base.holiday_proximity = 'Post-Christmas Sale' THEN 3
+        ELSE 9
+    END AS holiday_proximity_sort_key,
+
+    -- Metadata columns
+    base.dw_created_ts,
+    base.dw_source_system,
+    base.dw_version_desc,
 
     -- Calculate Relative Time Period Flags Dynamically
     CASE WHEN base.date = cv.current_date_val THEN 1 ELSE 0 END AS is_current_date,
@@ -596,141 +717,7 @@ SELECT
 FROM SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE base
 CROSS JOIN current_values cv;
 
-COMMENT ON VIEW SPG_DAP01.PBI.BUSINESS_CALENDAR IS 'View providing a comprehensive calendar dimension by combining the static BUSINESS_CALENDAR_BASE table with dynamically calculated relative time period flags (e.g., is_current_month, is_last_7_days). Use this view for all reporting and analysis. Relative flags are always up-to-date based on CURRENT_DATE() at query time.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.date IS 'Primary key. The specific calendar date (YYYY-MM-DD).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.date_key IS 'Integer representation of the date (YYYYMMDD).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.year_num IS 'Calendar year number (e.g., 2024).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.year_desc IS 'Calendar year description (e.g., CY24).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.quarter_num IS 'Calendar quarter number (1-4).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.quarter_desc IS 'Calendar quarter description (e.g., Q1).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.year_quarter_key IS 'Integer key for calendar year and quarter (YYYYQ).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.month_num IS 'Calendar month number (1-12).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.month_short_name IS 'Abbreviated calendar month name (e.g., Jan).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.month_long_name IS 'Full calendar month name (e.g., January).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.year_month_key IS 'Integer key for calendar year and month (YYYYMM).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.month_year_desc IS 'Calendar month and year description (e.g., Jan 2024).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.week_of_year_num IS 'Week number within the calendar year (depends on WEEK_START).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.year_of_week_num IS 'Year number associated with week_of_year_num (depends on WEEK_START).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.year_week_desc IS 'Year and week description (depends on WEEK_START).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.iso_week_num IS 'ISO 8601 week number (Week starts Monday).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.iso_year_of_week_num IS 'ISO 8601 year associated with the ISO week.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.iso_year_week_desc IS 'ISO 8601 Year and week description.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.day_of_month_num IS 'Day number within the calendar month (1-31).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.day_of_week_num IS 'Day number within the week (0=Sun or 1=Mon, depends on WEEK_START).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.iso_day_of_week_num IS 'ISO 8601 day number within the week (1=Monday, ..., 7=Sunday).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.day_of_year_num IS 'Day number within the calendar year (1-366).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.day_short_name IS 'Abbreviated day name (e.g., Mon).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.day_long_name IS 'Full day name (e.g., Monday).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.date_full_desc IS 'Full date description (e.g., 27 Mar 2024).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.date_formatted IS 'Date formatted as DD/MM/YYYY.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.month_start_date IS 'First day of the calendar month.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.month_end_date IS 'Last day of the calendar month.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.quarter_start_date IS 'First day of the calendar quarter.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.quarter_end_date IS 'Last day of the calendar quarter.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.year_start_date IS 'First day of the calendar year.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.year_end_date IS 'Last day of the calendar year.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.week_start_date IS 'First day of the week (depends on WEEK_START).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.week_end_date IS 'Last day of the week (depends on WEEK_START).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.day_of_month_count IS 'Sequential day number within the calendar month (1 to N).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.days_in_month_count IS 'Total number of days in the calendar month.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.day_of_quarter_count IS 'Sequential day number within the calendar quarter (1 to N).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.days_in_quarter_count IS 'Total number of days in the calendar quarter.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.week_of_month_num IS 'Week number within the calendar month (1-6).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.week_of_quarter_num IS 'Week number within the calendar quarter (1-14).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_weekday IS 'Indicator (1/0) if the day is Mon-Fri (based on ISO day).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.weekday_indicator IS 'Description (Weekday/Weekend).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_holiday IS 'Indicator (1/0) if the day exists in AUPUBLICHOLIDAYS.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.holiday_indicator IS 'Description (Holiday/Non-Holiday).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_trading_day IS 'Indicator (1/0) if Mon-Fri AND not a holiday.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.trading_day_desc IS 'Description (Trading Day/Weekend/Holiday).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.same_date_last_year IS 'The exact same calendar date from the previous year.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.same_business_day_last_year IS 'Equivalent business day (AU fiscal week & ISO day) from previous AU fiscal year.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_year_num IS 'AU Financial Year number (ending in this year).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_year_desc IS 'AU Financial Year description (e.g., FY24).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_quarter_num IS 'Quarter number within the AU Fiscal Year (1-4).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_quarter_desc IS 'AU Fiscal Quarter description.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_quarter_year_key IS 'Integer key for AU fiscal year and quarter (YYYYQ).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_month_num IS 'Month number within the AU Fiscal Year (1-12).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_month_desc IS 'AU Fiscal Month description.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_month_year_key IS 'Integer key for AU fiscal year and month (YYYYMM).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_week_num IS 'Sequential week number within the AU Fiscal Year.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_start_date_for_year IS 'Start date (July 1) of the AU Fiscal Year.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_end_date_for_year IS 'End date (June 30) of the AU Fiscal Year.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_quarter_start_date IS 'Start date of the AU Fiscal Quarter.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_quarter_end_date IS 'End date of the AU Fiscal Quarter.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_month_start_date IS 'Start date of the AU Fiscal Month.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.au_fiscal_month_end_date IS 'End date of the AU Fiscal Month.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_year_num IS 'Retail 4-4-5 Year number (ending ~June/July).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_year_desc IS 'Retail 4-4-5 Year description (e.g., F24).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_half_num IS 'Half number within the F445 Year (1 or 2).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_half_desc IS 'F445 Half description.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_quarter_num IS 'Quarter number within the F445 Year (1-4).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_quarter_desc IS 'F445 Quarter description.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_quarter_year_key IS 'Integer key for F445 year and quarter (YYYYQ).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_period_num IS 'Period number (month equiv) within F445 Year (1-12).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_period_desc IS 'F445 Period description.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_year_month_key IS 'Integer key for F445 year and period (YYYYPP).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_month_short_name IS 'Approx equivalent calendar month name for F445 period.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_month_long_name IS 'Approx equivalent full calendar month name for F445 period.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_month_year_desc IS 'F445 equivalent month and year desc (e.g., Jul F24).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_month_full_year_desc IS 'F445 equivalent full month and year desc (e.g., July F24).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_week_num IS 'Sequential week number within the F445 Year.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_start_of_year IS 'Start date of the F445 Year (first Mon of July).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.f445_end_of_year IS 'End date of the F445 Year.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.day_of_month_seq IS 'Sequential day number within calendar month.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.trading_day_of_month_seq IS 'Sequential trading day number within calendar month.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_first_day_of_month IS 'Indicator (1/0) for first day of calendar month.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_last_day_of_month IS 'Indicator (1/0) for last day of calendar month.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_first_day_of_quarter IS 'Indicator (1/0) for first day of calendar quarter.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_last_day_of_quarter IS 'Indicator (1/0) for last day of calendar quarter.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.next_date IS 'Next calendar date.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.previous_date IS 'Previous calendar date.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.next_trading_date IS 'Next trading date.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.previous_trading_date IS 'Previous trading date.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.trading_days_in_month IS 'Total trading days in calendar month.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.trading_days_in_quarter IS 'Total trading days in calendar quarter.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.trading_days_in_au_fiscal_month IS 'Total trading days in AU Fiscal Month.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.trading_days_in_au_fiscal_quarter IS 'Total trading days in AU Fiscal Quarter.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.trading_days_in_f445_period IS 'Total trading days in F445 Period.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.trading_days_in_f445_quarter IS 'Total trading days in F445 Quarter.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.retail_season IS 'Australian retail season category. Dates into Australian retail seasons: \'Christmas Season\' (Nov 1 - Dec 24), \'Back to School\' (Jan 15 - Feb 15), \'Easter Season\' (3 weeks prior to Good Friday incl. Easter Monday), \'EOFY Sales\' (June), \'Regular Season\' (other).';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.holiday_proximity IS 'Identifies specific periods near major holidays: \'Christmas Eve Period\' (Dec 20-24), \'Boxing Day\' (Dec 26), \'Post-Christmas Sale\' (Dec 27-31). NULL otherwise.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.dw_created_ts IS 'Timestamp when the base table row was created/updated.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.dw_source_system IS 'Procedure that generated the base table data.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.dw_version_desc IS 'Version description of the base table logic.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_current_date IS 'Indicator (1/0) if this date IS CURRENT_DATE(). Calculated dynamically.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_current_month IS 'Indicator (1/0) if this date is in the same calendar month as CURRENT_DATE(). Calculated dynamically.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_current_quarter IS 'Indicator (1/0) if this date is in the same calendar quarter as CURRENT_DATE(). Calculated dynamically.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_current_year IS 'Indicator (1/0) if this date is in the same calendar year as CURRENT_DATE(). Calculated dynamically.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_current_fiscal_year IS 'Indicator (1/0) if this date is in the same AU fiscal year as CURRENT_DATE(). Calculated dynamically.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_last_7_days IS 'Indicator (1/0) if this date is within the 6 days prior to CURRENT_DATE() or is CURRENT_DATE(). Calculated dynamically.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_last_30_days IS 'Indicator (1/0) if this date is within the 29 days prior to CURRENT_DATE() or is CURRENT_DATE(). Calculated dynamically.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_last_90_days IS 'Indicator (1/0) if this date is within the 89 days prior to CURRENT_DATE() or is CURRENT_DATE(). Calculated dynamically.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_previous_month IS 'Indicator (1/0) if this date is in the calendar month immediately preceding the month of CURRENT_DATE(). Calculated dynamically.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_previous_quarter IS 'Indicator (1/0) if this date is in the calendar quarter immediately preceding the quarter of CURRENT_DATE(). Calculated dynamically.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_rolling_12_months IS 'Indicator (1/0) if this date is within the 12 months preceding CURRENT_DATE() (inclusive). Calculated dynamically.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_rolling_quarter IS 'Indicator (1/0) if this date is within the 3 months preceding CURRENT_DATE() (inclusive). Calculated dynamically.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_year_to_date IS 'Indicator (1/0) if this date is within the current calendar year, up to and including CURRENT_DATE(). Calculated dynamically.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_fiscal_year_to_date IS 'Indicator (1/0) if this date is within the current AU fiscal year, up to and including CURRENT_DATE(). Calculated dynamically.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_quarter_to_date IS 'Indicator (1/0) if this date is within the current calendar quarter, up to and including CURRENT_DATE(). Calculated dynamically.';
-COMMENT ON COLUMN SPG_DAP01.PBI.BUSINESS_CALENDAR.is_month_to_date IS 'Indicator (1/0) if this date is within the current calendar month, up to and including CURRENT_DATE(). Calculated dynamically.';
+-- Add comment on the view itself
+COMMENT ON VIEW SPG_DAP01.PBI.BUSINESS_CALENDAR IS 'View providing a comprehensive calendar dimension by combining the static BUSINESS_CALENDAR_BASE table with dynamically calculated relative time period flags (e.g., is_current_month, is_last_7_days) and sort order columns for BI tools. Use this view for all reporting and analysis. Relative flags are always up-to-date based on CURRENT_DATE() at query time. Includes jurisdiction-specific holiday flags for all Australian states and territories.';
 
-
-
--- STEP 3: Adjust the Task Schedule (Run less frequently, e.g., monthly)
-
--- First, suspend the task to change it
--- ALTER TASK SPG_DAP01.PBI.BUSINESS_CALENDAR_TASK SUSPEND;
-
--- Then, modify the schedule (e.g., run 1st of every month at 1 AM)
--- ALTER TASK SPG_DAP01.PBI.BUSINESS_CALENDAR_TASK
---    SET
---    WAREHOUSE = WH_SPG_DAP01 -- Ensure warehouse is set if needed
---    SCHEDULE = 'USING CRON 0 1 1 * * Australia/Adelaide'; -- Changed to monthly
-
--- Finally, resume the task with the new schedule
--- ALTER TASK SPG_DAP01.PBI.BUSINESS_CALENDAR_TASK RESUME;
-
--- NOTE: You might even disable the schedule entirely (`SCHEDULE = NULL`)
--- and only run the procedure manually when needed via:
--- CALL SPG_DAP01.PBI.BUILD_BUSINESS_CALENDAR_SP();
+END;

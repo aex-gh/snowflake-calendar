@@ -1,4 +1,11 @@
-# Snowflake Business Calendar System
+- Standard Gregorian calendar
+- Australian Fiscal Year calendar (July-June)
+- Retail 4-4-5 calendar (starting first Monday of July)
+- Trading day calculations
+- Retail season identification
+- Dynamic relative time flags
+- Jurisdiction-specific holiday flags for all Australian states and territories
+- Sort order keys for proper ordering in BI tools# Snowflake Business Calendar System
 
 ## Overview
 
@@ -10,18 +17,20 @@ This repository contains SQL code for implementing a comprehensive business cale
 - Trading day calculations
 - Retail season identification
 - Dynamic relative time flags
+- Jurisdiction-specific holiday flags for all Australian states and territories
 
 ## Features
 
-- **Public Holiday Integration**: Automatically fetches Australian public holidays from data.gov.au
+- **Public Holiday Integration**: Automatically fetches Australian public holidays from data.gov.au with jurisdiction-specific flags (NSW, VIC, QLD, SA, WA, TAS, ACT, NT, National)
 - **Multiple Calendar Frameworks**: Supports Gregorian, Australian Fiscal, and Retail 4-4-5 calendars
 - **Trading Day Logic**: Identifies business days (weekdays excluding holidays)
 - **Year-over-Year Mapping**: Supports date comparisons via:
   - Same calendar date from previous year
   - Same business day from previous fiscal year
 - **Retail Seasons**: Identifies key retail periods (Christmas, Back to School, Easter, EOFY)
-- **Comprehensive Attributes**: 85+ calendar attributes for any date analysis need
+- **Comprehensive Attributes**: 100+ calendar attributes for any date analysis need
 - **Dynamic Relative Time Flags**: Automatically calculates time period flags (current month, YTD, MTD, etc.)
+- **BI-Friendly Sort Keys**: Dedicated sort order columns for months, quarters, weeks, and days to ensure proper ordering in BI tools
 
 ## Implementation Structure
 
@@ -151,3 +160,6 @@ Possible enhancements that could be implemented:
 - Calendar alert system for fiscal period boundaries
 - Data visualisation templates
 
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
