@@ -1,11 +1,4 @@
-- Standard Gregorian calendar
-- Australian Fiscal Year calendar (July-June)
-- Retail 4-4-5 calendar (starting first Monday of July)
-- Trading day calculations
-- Retail season identification
-- Dynamic relative time flags
-- Jurisdiction-specific holiday flags for all Australian states and territories
-- Sort order keys for proper ordering in BI tools# Snowflake Business Calendar System
+# Snowflake Business Calendar System
 
 ## Overview
 
@@ -18,6 +11,7 @@ This repository contains SQL code for implementing a comprehensive business cale
 - Retail season identification
 - Dynamic relative time flags
 - Jurisdiction-specific holiday flags for all Australian states and territories
+- Sort order keys for proper ordering in BI tools
 
 ## Features
 
