@@ -118,20 +118,6 @@ FROM sales s
 JOIN BUSINESS_CALENDAR bc ON s.date = bc.date;
 ```
 
-## Data Dictionary
-
-The business calendar contains 85+ columns including:
-
-- **Basic date attributes**: date, year, month, quarter, etc.
-- **Business indicators**: weekdays, holidays, trading days
-- **Fiscal calendar**: AU fiscal year, quarters, months
-- **Retail calendar**: 4-4-5 year, periods, weeks
-- **Trading day metrics**: trading day counts, sequences
-- **Retail seasons**: Christmas, Back to School, Easter, EOFY
-- **Relative time flags**: current_month, year_to_date, etc.
-
-For a complete data dictionary, refer to the column comments in the view definition.
-
 ## Maintenance
 
 - **Holiday Updates**: The holiday data should be refreshed periodically by calling `LOAD_AU_HOLIDAYS`
@@ -151,9 +137,3 @@ Possible enhancements that could be implemented:
 - Support for additional regions/countries
 - Extended retail metrics (trading weeks, promotional periods)
 - Custom holiday categorisation
-- Calendar alert system for fiscal period boundaries
-- Data visualisation templates
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
