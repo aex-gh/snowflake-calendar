@@ -434,14 +434,14 @@ FROM SPG_DAP01.PBI.AU_PUBLIC_HOLIDAYS;
 -- STEP 5A: Create function for date spine
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION SPG_DAP01.PBI.FN_GENERATE_DATE_SPINE(
-    start_date TIMESTAMP_NTZ,
-    end_date TIMESTAMP_NTZ,
-    date_grain STRING,  -- 'MINUTE', 'HOUR', 'DAY', 'WEEK', 'MONTH', 'QUARTER', 'YEAR'
-    timezone STRING DEFAULT 'UTC'  -- e.g., 'Australia/Sydney', 'Europe/London', 'America/New_York'
+    start_date DATE,  -- Changed to explicitly accept DATE
+    end_date DATE,    -- Changed to explicitly accept DATE
+    date_grain STRING,
+    timezone STRING DEFAULT 'UTC'
 )
 RETURNS TABLE (
     calendar_date TIMESTAMP_NTZ,
-    calendar_date_tz TIMESTAMP_TZ,
+    calendar_date_tz TIMESTAMP_NTZ,
     timezone STRING
 )
 AS
@@ -449,8 +449,8 @@ $$
     WITH row_count_calc AS (
         SELECT
             GREATEST(
-                DATEDIFF('MINUTE', start_date, end_date) * CASE WHEN UPPER(date_grain) = 'MINUTE' THEN 1 ELSE 0 END,
-                DATEDIFF('HOUR', start_date, end_date) * CASE WHEN UPPER(date_grain) = 'HOUR' THEN 1 ELSE 0 END,
+                DATEDIFF('MINUTE', start_date::TIMESTAMP_NTZ, end_date::TIMESTAMP_NTZ) * CASE WHEN UPPER(date_grain) = 'MINUTE' THEN 1 ELSE 0 END,
+                DATEDIFF('HOUR', start_date::TIMESTAMP_NTZ, end_date::TIMESTAMP_NTZ) * CASE WHEN UPPER(date_grain) = 'HOUR' THEN 1 ELSE 0 END,
                 DATEDIFF('DAY', start_date, end_date) * CASE WHEN UPPER(date_grain) IN ('DAY', '') OR date_grain IS NULL THEN 1 ELSE 0 END,
                 DATEDIFF('WEEK', start_date, end_date) * CASE WHEN UPPER(date_grain) = 'WEEK' THEN 1 ELSE 0 END,
                 DATEDIFF('MONTH', start_date, end_date) * CASE WHEN UPPER(date_grain) = 'MONTH' THEN 1 ELSE 0 END,
@@ -462,8 +462,8 @@ $$
     date_series AS (
         SELECT
             CASE
-                WHEN UPPER(date_grain) = 'MINUTE'  THEN DATEADD('MINUTE', seq4(), start_date)
-                WHEN UPPER(date_grain) = 'HOUR'    THEN DATEADD('HOUR', seq4(), start_date)
+                WHEN UPPER(date_grain) = 'MINUTE'  THEN DATEADD('MINUTE', seq4(), start_date::TIMESTAMP_NTZ)
+                WHEN UPPER(date_grain) = 'HOUR'    THEN DATEADD('HOUR', seq4(), start_date::TIMESTAMP_NTZ)
                 WHEN UPPER(date_grain) = 'WEEK'    THEN DATEADD('WEEK', seq4(), start_date)
                 WHEN UPPER(date_grain) = 'MONTH'   THEN DATEADD('MONTH', seq4(), start_date)
                 WHEN UPPER(date_grain) = 'QUARTER' THEN DATEADD('QUARTER', seq4(), start_date)
@@ -479,270 +479,237 @@ $$
         CONVERT_TIMEZONE('UTC', timezone, calendar_date) AS calendar_date_tz,
         timezone
     FROM date_series
-    WHERE calendar_date <= end_date
+    WHERE calendar_date <= end_date::TIMESTAMP_NTZ
     ORDER BY calendar_date
 $$;
 
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
--- STEP 5B: Create function for holidays
+-- STEP 5B: Create stored procedure for holidays
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION SPG_DAP01.PBI.FN_PROCESS_HOLIDAYS(calendar_table STRING)
-RETURNS TABLE (
-    date DATE,
-    holiday_metadata OBJECT,
-    is_holiday NUMBER(1,0),
-    holiday_indicator STRING,
-    holiday_desc STRING
+CREATE OR REPLACE PROCEDURE SPG_DAP01.PBI.SP_PROCESS_HOLIDAYS(
+    calendar_table STRING,
+    output_table STRING
 )
+RETURNS STRING
+LANGUAGE SQL
 AS
 $$
-    WITH holiday_by_jurisdiction AS (
-        SELECT
-            h.DATE,
-            -- Create a flexible object with jurisdiction flags
-            OBJECT_CONSTRUCT(
-                'is_holiday_nsw', MAX(CASE WHEN UPPER(h.STATE) = 'NSW' THEN 1 ELSE 0 END),
-                'is_holiday_vic', MAX(CASE WHEN UPPER(h.STATE) = 'VIC' THEN 1 ELSE 0 END),
-                'is_holiday_qld', MAX(CASE WHEN UPPER(h.STATE) = 'QLD' THEN 1 ELSE 0 END),
-                'is_holiday_sa', MAX(CASE WHEN UPPER(h.STATE) = 'SA' THEN 1 ELSE 0 END),
-                'is_holiday_wa', MAX(CASE WHEN UPPER(h.STATE) = 'WA' THEN 1 ELSE 0 END),
-                'is_holiday_tas', MAX(CASE WHEN UPPER(h.STATE) = 'TAS' THEN 1 ELSE 0 END),
-                'is_holiday_act', MAX(CASE WHEN UPPER(h.STATE) = 'ACT' THEN 1 ELSE 0 END),
-                'is_holiday_nt', MAX(CASE WHEN UPPER(h.STATE) = 'NT' THEN 1 ELSE 0 END),
-                'is_holiday_national', CASE
-                    WHEN MAX(CASE WHEN UPPER(STATE) = 'NATIONAL' THEN 1 ELSE 0 END) = 1 THEN 1
-                    WHEN MIN(CASE
-                            WHEN UPPER(STATE) IN ('NSW', 'VIC', 'QLD', 'SA', 'WA', 'TAS', 'ACT', 'NT') THEN 1
-                            ELSE 0
-                            END) = 1
-                    AND COUNT(DISTINCT UPPER(STATE)) >= 8 THEN 1
-                    ELSE 0
-                END
-            ) AS holiday_metadata,
-            -- Combine holiday names with states in parentheses
-            LISTAGG(DISTINCT HOLIDAY_NAME || ' (' || UPPER(STATE) || ')', '; ') AS holiday_names
-        FROM SPG_DAP01.PBI.AU_PUBLIC_HOLIDAYS_VW h
-        GROUP BY h.DATE
-    ),
-    calendar_with_holidays AS (
+DECLARE
+    query STRING;
+BEGIN
+    -- Drop the output table if it exists
+    EXECUTE IMMEDIATE 'DROP TABLE IF EXISTS ' || output_table;
+
+    -- Construct the dynamic query
+    query := 'CREATE TABLE ' || output_table || ' AS
         SELECT
             cal.calendar_date AS date,
-            COALESCE(h.holiday_metadata, OBJECT_CONSTRUCT()) AS holiday_metadata,
-            h.holiday_names AS holiday_desc,
-            -- A date is a holiday if it's a holiday in any jurisdiction
-            CASE WHEN h.DATE IS NOT NULL THEN 1 ELSE 0 END AS is_holiday,
-            CASE WHEN h.DATE IS NOT NULL THEN 'Holiday' ELSE 'Non-Holiday' END AS holiday_indicator
-        FROM IDENTIFIER($calendar_table) cal
-        LEFT JOIN holiday_by_jurisdiction h ON cal.calendar_date = h.DATE
-    )
-    SELECT
-        date,
-        holiday_metadata,
-        is_holiday,
-        holiday_indicator,
-        holiday_desc
-    FROM calendar_with_holidays
+            COALESCE(
+                OBJECT_CONSTRUCT(
+                    ''is_holiday_nsw'', MAX(CASE WHEN UPPER(h.STATE) = ''NSW'' THEN 1 ELSE 0 END),
+                    ''is_holiday_vic'', MAX(CASE WHEN UPPER(h.STATE) = ''VIC'' THEN 1 ELSE 0 END),
+                    ''is_holiday_qld'', MAX(CASE WHEN UPPER(h.STATE) = ''QLD'' THEN 1 ELSE 0 END),
+                    ''is_holiday_sa'', MAX(CASE WHEN UPPER(h.STATE) = ''SA'' THEN 1 ELSE 0 END),
+                    ''is_holiday_wa'', MAX(CASE WHEN UPPER(h.STATE) = ''WA'' THEN 1 ELSE 0 END),
+                    ''is_holiday_tas'', MAX(CASE WHEN UPPER(h.STATE) = ''TAS'' THEN 1 ELSE 0 END),
+                    ''is_holiday_act'', MAX(CASE WHEN UPPER(h.STATE) = ''ACT'' THEN 1 ELSE 0 END),
+                    ''is_holiday_nt'', MAX(CASE WHEN UPPER(h.STATE) = ''NT'' THEN 1 ELSE 0 END),
+                    ''is_holiday_national'', MAX(CASE
+                        WHEN UPPER(h.STATE) = ''NATIONAL'' THEN 1
+                        WHEN COUNT(DISTINCT CASE WHEN UPPER(h.STATE) IN (''NSW'', ''VIC'', ''QLD'', ''SA'', ''WA'', ''TAS'', ''ACT'', ''NT'') THEN UPPER(h.STATE) END) OVER (PARTITION BY cal.calendar_date) >= 8 THEN 1
+                        ELSE 0
+                    END)
+                ),
+                OBJECT_CONSTRUCT()
+            ) AS holiday_metadata,
+            CASE WHEN MAX(h.DATE) IS NOT NULL THEN 1 ELSE 0 END AS is_holiday,
+            CASE WHEN MAX(h.DATE) IS NOT NULL THEN ''Holiday'' ELSE ''Non-Holiday'' END AS holiday_indicator,
+            LISTAGG(DISTINCT CASE WHEN h.HOLIDAY_NAME IS NOT NULL THEN h.HOLIDAY_NAME || '' ('' || UPPER(h.STATE) || '')'' ELSE NULL END, ''; '') AS holiday_desc
+        FROM ' || calendar_table || ' cal
+        LEFT JOIN SPG_DAP01.PBI.AU_PUBLIC_HOLIDAYS_VW h ON cal.calendar_date = h.DATE
+        GROUP BY cal.calendar_date';
+
+    -- Execute the query
+    EXECUTE IMMEDIATE query;
+
+    RETURN 'Successfully processed holidays into ' || output_table;
+EXCEPTION
+    WHEN OTHER THEN
+        RETURN 'Error: ' || SQLERRM;
+END;
 $$;
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
--- STEP 5C: Create function for Gregorian calendar
+-- STEP 5C: Create stored procedure for Gregorian calendar
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION SPG_DAP01.PBI.FN_GENERATE_GREGORIAN_CALENDAR(
+CREATE OR REPLACE PROCEDURE SPG_DAP01.PBI.SP_GENERATE_GREGORIAN_CALENDAR(
     start_date DATE,
     end_date DATE,
     date_grain STRING,
-    timezone STRING
+    timezone STRING,
+    target_table STRING
 )
-RETURNS TABLE (
-    date DATE,
-    date_key NUMBER,
-    year_num NUMBER,
-    year_desc STRING,
-    quarter_num NUMBER,
-    quarter_desc STRING,
-    year_quarter_key NUMBER,
-    month_num NUMBER,
-    month_short_name STRING,
-    month_long_name STRING,
-    year_month_key NUMBER,
-    month_year_desc STRING,
-    week_of_year_num NUMBER,
-    year_of_week_num NUMBER,
-    year_week_desc STRING,
-    iso_week_num NUMBER,
-    iso_year_of_week_num NUMBER,
-    iso_year_week_desc STRING,
-    day_of_month_num NUMBER,
-    day_of_week_num NUMBER,
-    iso_day_of_week_num NUMBER,
-    day_of_year_num NUMBER,
-    day_short_name STRING,
-    day_long_name STRING,
-    date_full_desc STRING,
-    date_formatted STRING,
-    month_start_date DATE,
-    month_end_date DATE,
-    quarter_start_date DATE,
-    quarter_end_date DATE,
-    year_start_date DATE,
-    year_end_date DATE,
-    week_start_date DATE,
-    week_end_date DATE,
-    day_of_month_count NUMBER,
-    days_in_month_count NUMBER,
-    day_of_quarter_count NUMBER,
-    days_in_quarter_count NUMBER,
-    week_of_month_num NUMBER,
-    week_of_quarter_num NUMBER,
-    is_weekday NUMBER,
-    weekday_indicator STRING,
-    same_date_last_year DATE
-)
+RETURNS STRING
+LANGUAGE SQL
 AS
 $$
+DECLARE
+    sql_command STRING;
+    status STRING DEFAULT 'SUCCESS';
+BEGIN
+    -- Build the SQL to create/replace the target table
+    sql_command := '
+    CREATE OR REPLACE TABLE ' || target_table || ' AS
     WITH date_generator AS (
         SELECT calendar_date::DATE AS calendar_date
         FROM TABLE(SPG_DAP01.PBI.FN_GENERATE_DATE_SPINE(
-            start_date,
-            end_date,
-            date_grain,
-            timezone
+            ''' || start_date || ''',
+            ''' || end_date || ''',
+            ''' || date_grain || ''',
+            ''' || timezone || '''
         ))
     )
-
+    
     SELECT
         dg.calendar_date                                      AS date,
-        TO_NUMBER(TO_CHAR(dg.calendar_date, 'YYYYMMDD'))     AS date_key,
+        TO_NUMBER(TO_CHAR(dg.calendar_date, ''YYYYMMDD''))     AS date_key,
         YEAR(dg.calendar_date)                                AS year_num,
-        'CY' || MOD(YEAR(dg.calendar_date), 100)::STRING     AS year_desc,
+        ''CY'' || MOD(YEAR(dg.calendar_date), 100)::STRING     AS year_desc,
         QUARTER(dg.calendar_date)                             AS quarter_num,
-        'Q' || QUARTER(dg.calendar_date)                      AS quarter_desc,
+        ''Q'' || QUARTER(dg.calendar_date)                      AS quarter_desc,
         YEAR(dg.calendar_date) * 10 + QUARTER(dg.calendar_date) AS year_quarter_key,
         MONTH(dg.calendar_date)                               AS month_num,
         MONTHNAME(dg.calendar_date)                           AS month_short_name,
         CASE MONTH(dg.calendar_date)
-            WHEN 1 THEN 'January' WHEN 2 THEN 'February' WHEN 3 THEN 'March'
-            WHEN 4 THEN 'April' WHEN 5 THEN 'May' WHEN 6 THEN 'June'
-            WHEN 7 THEN 'July' WHEN 8 THEN 'August' WHEN 9 THEN 'September'
-            WHEN 10 THEN 'October' WHEN 11 THEN 'November' WHEN 12 THEN 'December'
+            WHEN 1 THEN ''January'' WHEN 2 THEN ''February'' WHEN 3 THEN ''March''
+            WHEN 4 THEN ''April'' WHEN 5 THEN ''May'' WHEN 6 THEN ''June''
+            WHEN 7 THEN ''July'' WHEN 8 THEN ''August'' WHEN 9 THEN ''September''
+            WHEN 10 THEN ''October'' WHEN 11 THEN ''November'' WHEN 12 THEN ''December''
         END                                                    AS month_long_name,
         YEAR(dg.calendar_date) * 100 + MONTH(dg.calendar_date) AS year_month_key,
-        CONCAT(MONTHNAME(dg.calendar_date), ' ', YEAR(dg.calendar_date)) AS month_year_desc,
+        CONCAT(MONTHNAME(dg.calendar_date), '' '', YEAR(dg.calendar_date)) AS month_year_desc,
         WEEKOFYEAR(dg.calendar_date)                          AS week_of_year_num,
         YEAROFWEEK(dg.calendar_date)                          AS year_of_week_num,
-        CONCAT(YEAROFWEEK(dg.calendar_date), '-W', LPAD(WEEKOFYEAR(dg.calendar_date), 2, '0')) AS year_week_desc,
+        CONCAT(YEAROFWEEK(dg.calendar_date), ''-W'', LPAD(WEEKOFYEAR(dg.calendar_date), 2, ''0'')) AS year_week_desc,
         WEEKISO(dg.calendar_date)                             AS iso_week_num,
         YEAROFWEEKISO(dg.calendar_date)                       AS iso_year_of_week_num,
-        CONCAT(YEAROFWEEKISO(dg.calendar_date), '-W', LPAD(WEEKISO(dg.calendar_date), 2, '0')) AS iso_year_week_desc,
+        CONCAT(YEAROFWEEKISO(dg.calendar_date), ''-W'', LPAD(WEEKISO(dg.calendar_date), 2, ''0'')) AS iso_year_week_desc,
         DAY(dg.calendar_date)                                 AS day_of_month_num,
         DAYOFWEEK(dg.calendar_date)                           AS day_of_week_num, -- Sunday = 0
         DAYOFWEEKISO(dg.calendar_date)                        AS iso_day_of_week_num, -- Monday = 1
         DAYOFYEAR(dg.calendar_date)                           AS day_of_year_num,
         DAYNAME(dg.calendar_date)                             AS day_short_name,
         CASE DAYOFWEEK(dg.calendar_date)
-            WHEN 0 THEN 'Sunday' WHEN 1 THEN 'Monday' WHEN 2 THEN 'Tuesday'
-            WHEN 3 THEN 'Wednesday' WHEN 4 THEN 'Thursday' WHEN 5 THEN 'Friday'
-            WHEN 6 THEN 'Saturday'
+            WHEN 0 THEN ''Sunday'' WHEN 1 THEN ''Monday'' WHEN 2 THEN ''Tuesday''
+            WHEN 3 THEN ''Wednesday'' WHEN 4 THEN ''Thursday'' WHEN 5 THEN ''Friday''
+            WHEN 6 THEN ''Saturday''
         END                                                    AS day_long_name,
-        TO_CHAR(dg.calendar_date, 'DD Mon YYYY')              AS date_full_desc,
-        TO_CHAR(dg.calendar_date, 'DD/MM/YYYY')               AS date_formatted,
-        DATE_TRUNC('MONTH', dg.calendar_date)                 AS month_start_date,
+        TO_CHAR(dg.calendar_date, ''DD Mon YYYY'')              AS date_full_desc,
+        TO_CHAR(dg.calendar_date, ''DD/MM/YYYY'')               AS date_formatted,
+        DATE_TRUNC(''MONTH'', dg.calendar_date)                 AS month_start_date,
         LAST_DAY(dg.calendar_date)                            AS month_end_date,
-        DATE_TRUNC('QUARTER', dg.calendar_date)               AS quarter_start_date,
+        DATE_TRUNC(''QUARTER'', dg.calendar_date)               AS quarter_start_date,
         LAST_DAY(dg.calendar_date, QUARTER)                   AS quarter_end_date,
-        DATE_TRUNC('YEAR', dg.calendar_date)                  AS year_start_date,
+        DATE_TRUNC(''YEAR'', dg.calendar_date)                  AS year_start_date,
         LAST_DAY(dg.calendar_date, YEAR)                      AS year_end_date,
-        DATE_TRUNC('WEEK', dg.calendar_date)                  AS week_start_date,
+        DATE_TRUNC(''WEEK'', dg.calendar_date)                  AS week_start_date,
         LAST_DAY(dg.calendar_date, WEEK)                      AS week_end_date,
-        DATEDIFF(DAY, DATE_TRUNC('MONTH', dg.calendar_date), dg.calendar_date) + 1 AS day_of_month_count,
+        DATEDIFF(DAY, DATE_TRUNC(''MONTH'', dg.calendar_date), dg.calendar_date) + 1 AS day_of_month_count,
         DAY(LAST_DAY(dg.calendar_date))                       AS days_in_month_count,
-        DATEDIFF(DAY, DATE_TRUNC('QUARTER', dg.calendar_date), dg.calendar_date) + 1 AS day_of_quarter_count,
-        DATEDIFF(DAY, DATE_TRUNC('QUARTER', dg.calendar_date), LAST_DAY(dg.calendar_date, QUARTER)) + 1 AS days_in_quarter_count,
+        DATEDIFF(DAY, DATE_TRUNC(''QUARTER'', dg.calendar_date), dg.calendar_date) + 1 AS day_of_quarter_count,
+        DATEDIFF(DAY, DATE_TRUNC(''QUARTER'', dg.calendar_date), LAST_DAY(dg.calendar_date, QUARTER)) + 1 AS days_in_quarter_count,
         CEIL(DAY(dg.calendar_date) / 7.0)                     AS week_of_month_num,
-        CEIL((DATEDIFF(DAY, DATE_TRUNC('QUARTER', dg.calendar_date), dg.calendar_date) + 1) / 7.0) AS week_of_quarter_num,
+        CEIL((DATEDIFF(DAY, DATE_TRUNC(''QUARTER'', dg.calendar_date), dg.calendar_date) + 1) / 7.0) AS week_of_quarter_num,
         CASE WHEN DAYOFWEEKISO(dg.calendar_date) IN (6, 7) THEN 0 ELSE 1 END AS is_weekday, -- ISO Weekday 1-5
-        CASE WHEN DAYOFWEEKISO(dg.calendar_date) IN (6, 7) THEN 'Weekend' ELSE 'Weekday' END AS weekday_indicator, -- ISO Weekend 6,7
+        CASE WHEN DAYOFWEEKISO(dg.calendar_date) IN (6, 7) THEN ''Weekend'' ELSE ''Weekday'' END AS weekday_indicator, -- ISO Weekend 6,7
         DATEADD(YEAR, -1, dg.calendar_date)                   AS same_date_last_year
     FROM date_generator dg
     ORDER BY date
+    ';
+
+    -- Execute the SQL
+    BEGIN
+        EXECUTE IMMEDIATE sql_command;
+    EXCEPTION
+        WHEN OTHER THEN
+            status := 'ERROR: ' || SQLERRM;
+    END;
+
+    RETURN status;
+END;
 $$;
 
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
--- STEP 5D: Create function for Fiscal calendar
+-- STEP 5D: Create stored procedure for Fiscal calendar
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION SPG_DAP01.PBI.FN_GENERATE_AU_FISCAL_CALENDAR(
-    base_calendar_table STRING
+CREATE OR REPLACE PROCEDURE SPG_DAP01.PBI.SP_GENERATE_AU_FISCAL_CALENDAR(
+    base_calendar_table STRING,
+    target_table STRING
 )
-RETURNS TABLE (
-    date DATE,
-    au_fiscal_start_date_for_year DATE,
-    au_fiscal_end_date_for_year DATE,
-    au_fiscal_year_num NUMBER,
-    au_fiscal_year_desc STRING,
-    au_fiscal_quarter_num NUMBER,
-    au_fiscal_quarter_year_key NUMBER,
-    au_fiscal_quarter_desc STRING,
-    au_fiscal_quarter_start_date DATE,
-    au_fiscal_quarter_end_date DATE,
-    au_fiscal_month_num NUMBER,
-    au_fiscal_month_year_key NUMBER,
-    au_fiscal_month_desc STRING,
-    au_fiscal_month_start_date DATE,
-    au_fiscal_month_end_date DATE,
-    au_fiscal_week_num NUMBER,
-    same_business_day_last_year DATE
-)
+RETURNS STRING
+LANGUAGE SQL
 AS
 $$
+DECLARE
+    sql_command STRING;
+    status STRING DEFAULT 'SUCCESS';
+BEGIN
+    -- Build the SQL to create/replace the target table
+    sql_command := '
+    CREATE OR REPLACE TABLE ' || target_table || ' AS
     WITH au_fiscal_base AS (
         SELECT
-            calendar_date AS date,
+            date,
             year_num,
             month_num,
+            iso_day_of_week_num,
             CASE WHEN month_num >= 7
                 THEN DATE_FROM_PARTS(year_num, 7, 1)
                 ELSE DATE_FROM_PARTS(year_num - 1, 7, 1)
             END AS au_fiscal_start_date_for_year,
-            DATEADD(YEAR, 1, au_fiscal_start_date_for_year) - 1 AS au_fiscal_end_date_for_year
-        FROM IDENTIFIER($base_calendar_table)
+            DATEADD(YEAR, 1, CASE WHEN month_num >= 7
+                THEN DATE_FROM_PARTS(year_num, 7, 1)
+                ELSE DATE_FROM_PARTS(year_num - 1, 7, 1)
+            END) - 1 AS au_fiscal_end_date_for_year
+        FROM ' || base_calendar_table || '
     ),
     au_fiscal_years AS (
         SELECT
             afb.date,
+            afb.iso_day_of_week_num,
             afb.au_fiscal_start_date_for_year,
             afb.au_fiscal_end_date_for_year,
             YEAR(afb.au_fiscal_start_date_for_year) + 1 AS au_fiscal_year_num,
-            'FY' || MOD(YEAR(afb.au_fiscal_start_date_for_year) + 1, 100)::STRING AS au_fiscal_year_desc
+            ''FY'' || MOD(YEAR(afb.au_fiscal_start_date_for_year) + 1, 100)::STRING AS au_fiscal_year_desc
         FROM au_fiscal_base afb
     ),
     au_fiscal_details AS (
         SELECT
             afy.date,
+            afy.iso_day_of_week_num,
             afy.au_fiscal_start_date_for_year,
             afy.au_fiscal_end_date_for_year,
             afy.au_fiscal_year_num,
             afy.au_fiscal_year_desc,
             DATEDIFF(QUARTER, afy.au_fiscal_start_date_for_year, afy.date) + 1 AS au_fiscal_quarter_num,
             afy.au_fiscal_year_num * 10 + (DATEDIFF(QUARTER, afy.au_fiscal_start_date_for_year, afy.date) + 1) AS au_fiscal_quarter_year_key,
-            'QTR ' || (DATEDIFF(QUARTER, afy.au_fiscal_start_date_for_year, afy.date) + 1)::STRING AS au_fiscal_quarter_desc,
+            ''QTR '' || (DATEDIFF(QUARTER, afy.au_fiscal_start_date_for_year, afy.date) + 1)::STRING AS au_fiscal_quarter_desc,
             DATEADD(QUARTER, DATEDIFF(QUARTER, afy.au_fiscal_start_date_for_year, afy.date), afy.au_fiscal_start_date_for_year) AS au_fiscal_quarter_start_date,
-            DATEADD(DAY, -1, DATEADD(QUARTER, 1, au_fiscal_quarter_start_date)) AS au_fiscal_quarter_end_date,
+            DATEADD(DAY, -1, DATEADD(QUARTER, 1, DATEADD(QUARTER, DATEDIFF(QUARTER, afy.au_fiscal_start_date_for_year, afy.date), afy.au_fiscal_start_date_for_year))) AS au_fiscal_quarter_end_date,
             MOD(DATEDIFF(MONTH, afy.au_fiscal_start_date_for_year, afy.date), 12) + 1 AS au_fiscal_month_num,
             afy.au_fiscal_year_num * 100 + (MOD(DATEDIFF(MONTH, afy.au_fiscal_start_date_for_year, afy.date), 12) + 1) AS au_fiscal_month_year_key,
-            'Month ' || LPAD((MOD(DATEDIFF(MONTH, afy.au_fiscal_start_date_for_year, afy.date), 12) + 1)::STRING, 2, '0') AS au_fiscal_month_desc,
+            ''Month '' || LPAD((MOD(DATEDIFF(MONTH, afy.au_fiscal_start_date_for_year, afy.date), 12) + 1)::STRING, 2, ''0'') AS au_fiscal_month_desc,
             DATEADD(MONTH, DATEDIFF(MONTH, afy.au_fiscal_start_date_for_year, afy.date), afy.au_fiscal_start_date_for_year) AS au_fiscal_month_start_date,
-            LAST_DAY(au_fiscal_month_start_date) AS au_fiscal_month_end_date,
+            LAST_DAY(DATEADD(MONTH, DATEDIFF(MONTH, afy.au_fiscal_start_date_for_year, afy.date), afy.au_fiscal_start_date_for_year)) AS au_fiscal_month_end_date,
             FLOOR(DATEDIFF(DAY, afy.au_fiscal_start_date_for_year, afy.date) / 7) + 1 AS au_fiscal_week_num
         FROM au_fiscal_years afy
     ),
-    -- Calculate the same business day last year
     cal_data AS (
         SELECT
             date,
             au_fiscal_year_num,
             au_fiscal_week_num,
-            bc.iso_day_of_week_num
-        FROM au_fiscal_details afd
-        JOIN IDENTIFIER($base_calendar_table) bc ON afd.date = bc.calendar_date
+            iso_day_of_week_num
+        FROM au_fiscal_details
     ),
     business_day_mapping AS (
         SELECT
@@ -751,10 +718,9 @@ $$
         FROM cal_data curr
         LEFT JOIN cal_data prev
             ON prev.au_fiscal_year_num = curr.au_fiscal_year_num - 1
-           AND prev.au_fiscal_week_num = curr.au_fiscal_week_num
-           AND prev.iso_day_of_week_num = curr.iso_day_of_week_num
+            AND prev.au_fiscal_week_num = curr.au_fiscal_week_num
+            AND prev.iso_day_of_week_num = curr.iso_day_of_week_num
     )
-
     SELECT
         afd.date,
         afd.au_fiscal_start_date_for_year,
@@ -776,40 +742,42 @@ $$
     FROM au_fiscal_details afd
     LEFT JOIN business_day_mapping bdm ON afd.date = bdm.date
     ORDER BY date
+    ';
+
+    -- Execute the SQL
+    BEGIN
+        EXECUTE IMMEDIATE sql_command;
+    EXCEPTION
+        WHEN OTHER THEN
+            status := 'ERROR: ' || SQLERRM;
+    END;
+
+    RETURN status;
+END;
 $$;
 
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
--- STEP 5E: Create function for Retail calendar (445,454,544)
+-- STEP 5E: Create stored procedure for Retail calendar (445,454,544)
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION SPG_DAP01.PBI.FN_GENERATE_RETAIL_CALENDAR(
+CREATE OR REPLACE PROCEDURE SPG_DAP01.PBI.SP_GENERATE_RETAIL_CALENDAR(
     base_calendar_table STRING,
+    target_table STRING,
     retail_pattern STRING
 )
-RETURNS TABLE (
-    date DATE,
-    retail_start_of_year DATE,
-    retail_end_of_year DATE,
-    retail_year_num NUMBER,
-    retail_year_desc STRING,
-    retail_week_num NUMBER,
-    retail_half_num NUMBER,
-    retail_half_desc STRING,
-    retail_quarter_num NUMBER,
-    retail_quarter_desc STRING,
-    retail_quarter_year_key NUMBER,
-    retail_period_num NUMBER,
-    retail_period_desc STRING,
-    retail_year_month_key NUMBER,
-    retail_month_short_name STRING,
-    retail_month_long_name STRING,
-    retail_month_year_desc STRING,
-    retail_month_full_year_desc STRING
-)
+RETURNS STRING
+LANGUAGE SQL
 AS
 $$
+DECLARE
+    sql_command STRING;
+    status STRING DEFAULT 'SUCCESS';
+BEGIN
+    -- Build the SQL to create/replace the target table
+    sql_command := '
+    CREATE OR REPLACE TABLE ' || target_table || ' AS
     WITH retail_year_markers AS (
         SELECT
-            calendar_date AS date,
+            date,
             year_num,
             month_num,
             day_of_month_num,
@@ -819,7 +787,7 @@ $$
                 THEN 1
                 ELSE 0
             END AS is_retail_soy_marker
-        FROM IDENTIFIER($base_calendar_table)
+        FROM ' || base_calendar_table || '
     ),
     retail_years AS (
         SELECT
@@ -839,26 +807,26 @@ $$
                  WHERE fy_inner.retail_start_of_year = retail_years.retail_start_of_year)
             ) AS retail_end_of_year,
             YEAR(DATEADD(DAY, 363, retail_start_of_year)) AS retail_year_num,
-            'F' || MOD(YEAR(DATEADD(DAY, 363, retail_start_of_year)), 100)::STRING AS retail_year_desc
+            ''F'' || MOD(YEAR(DATEADD(DAY, 363, retail_start_of_year)), 100)::STRING AS retail_year_desc
         FROM retail_years
         WHERE retail_start_of_year IS NOT NULL
     ),
     retail_base AS (
         SELECT
-            cal.calendar_date AS date,
+            cal.date,
             fy.retail_start_of_year,
             fy.retail_end_of_year,
             fy.retail_year_num,
             fy.retail_year_desc,
             CASE
-                WHEN cal.calendar_date >= fy.retail_start_of_year
-                THEN FLOOR(DATEDIFF(DAY, fy.retail_start_of_year, cal.calendar_date) / 7) + 1
+                WHEN cal.date >= fy.retail_start_of_year
+                THEN FLOOR(DATEDIFF(DAY, fy.retail_start_of_year, cal.date) / 7) + 1
                 ELSE NULL
             END AS retail_week_num
-        FROM IDENTIFIER($base_calendar_table) cal
+        FROM ' || base_calendar_table || ' cal
         LEFT JOIN retail_years_processed fy
-            ON cal.calendar_date >= fy.retail_start_of_year
-            AND cal.calendar_date <= fy.retail_end_of_year
+            ON cal.date >= fy.retail_start_of_year
+            AND cal.date <= fy.retail_end_of_year
     ),
     retail_detail AS (
         SELECT
@@ -870,7 +838,7 @@ $$
             rb.retail_week_num,
             -- Period calculation varies based on selected pattern
             CASE
-                WHEN $retail_pattern = '445' THEN
+                WHEN ''' || retail_pattern || ''' = ''445'' THEN
                     CASE rb.retail_week_num
                         WHEN 1 THEN 1 WHEN 2 THEN 1 WHEN 3 THEN 1 WHEN 4 THEN 1 -- P1
                         WHEN 5 THEN 2 WHEN 6 THEN 2 WHEN 7 THEN 2 WHEN 8 THEN 2 -- P2
@@ -887,7 +855,7 @@ $$
                         WHEN 53 THEN 12
                         ELSE NULL
                     END
-                WHEN $retail_pattern = '454' THEN
+                WHEN ''' || retail_pattern || ''' = ''454'' THEN
                     CASE rb.retail_week_num
                         WHEN 1 THEN 1 WHEN 2 THEN 1 WHEN 3 THEN 1 WHEN 4 THEN 1 -- P1
                         WHEN 5 THEN 2 WHEN 6 THEN 2 WHEN 7 THEN 2 WHEN 8 THEN 2 WHEN 9 THEN 2 -- P2
@@ -904,7 +872,7 @@ $$
                         WHEN 53 THEN 12
                         ELSE NULL
                     END
-                WHEN $retail_pattern = '544' THEN
+                WHEN ''' || retail_pattern || ''' = ''544'' THEN
                     CASE rb.retail_week_num
                         WHEN 1 THEN 1 WHEN 2 THEN 1 WHEN 3 THEN 1 WHEN 4 THEN 1 WHEN 5 THEN 1 -- P1
                         WHEN 6 THEN 2 WHEN 7 THEN 2 WHEN 8 THEN 2 WHEN 9 THEN 2 -- P2
@@ -965,26 +933,26 @@ $$
                 ELSE NULL
             END AS retail_quarter_num,
 
-            'HALF ' || retail_half_num::STRING AS retail_half_desc,
-            'QTR ' || retail_quarter_num::STRING AS retail_quarter_desc,
+            ''HALF '' || retail_half_num::STRING AS retail_half_desc,
+            ''QTR '' || retail_quarter_num::STRING AS retail_quarter_desc,
             rd.retail_year_num * 10 + retail_quarter_num AS retail_quarter_year_key,
-            'MONTH ' || retail_period_num::STRING AS retail_period_desc,
+            ''MONTH '' || retail_period_num::STRING AS retail_period_desc,
             rd.retail_year_num * 100 + retail_period_num AS retail_year_month_key,
 
             CASE retail_period_num
-                WHEN 1 THEN 'Jul' WHEN 2 THEN 'Aug' WHEN 3 THEN 'Sep' WHEN 4 THEN 'Oct'
-                WHEN 5 THEN 'Nov' WHEN 6 THEN 'Dec' WHEN 7 THEN 'Jan' WHEN 8 THEN 'Feb'
-                WHEN 9 THEN 'Mar' WHEN 10 THEN 'Apr' WHEN 11 THEN 'May' WHEN 12 THEN 'Jun'
+                WHEN 1 THEN ''Jul'' WHEN 2 THEN ''Aug'' WHEN 3 THEN ''Sep'' WHEN 4 THEN ''Oct''
+                WHEN 5 THEN ''Nov'' WHEN 6 THEN ''Dec'' WHEN 7 THEN ''Jan'' WHEN 8 THEN ''Feb''
+                WHEN 9 THEN ''Mar'' WHEN 10 THEN ''Apr'' WHEN 11 THEN ''May'' WHEN 12 THEN ''Jun''
             END AS retail_month_short_name,
 
             CASE retail_period_num
-                WHEN 1 THEN 'July' WHEN 2 THEN 'August' WHEN 3 THEN 'September' WHEN 4 THEN 'October'
-                WHEN 5 THEN 'November' WHEN 6 THEN 'December' WHEN 7 THEN 'January' WHEN 8 THEN 'February'
-                WHEN 9 THEN 'March' WHEN 10 THEN 'April' WHEN 11 THEN 'May' WHEN 12 THEN 'June'
+                WHEN 1 THEN ''July'' WHEN 2 THEN ''August'' WHEN 3 THEN ''September'' WHEN 4 THEN ''October''
+                WHEN 5 THEN ''November'' WHEN 6 THEN ''December'' WHEN 7 THEN ''January'' WHEN 8 THEN ''February''
+                WHEN 9 THEN ''March'' WHEN 10 THEN ''April'' WHEN 11 THEN ''May'' WHEN 12 THEN ''June''
             END AS retail_month_long_name,
 
-            CONCAT(retail_month_short_name, ' ', rd.retail_year_num::STRING) AS retail_month_year_desc,
-            CONCAT(retail_month_long_name, ' ', rd.retail_year_num::STRING) AS retail_month_full_year_desc
+            CONCAT(retail_month_short_name, '' '', rd.retail_year_num::STRING) AS retail_month_year_desc,
+            CONCAT(retail_month_long_name, '' '', rd.retail_year_num::STRING) AS retail_month_full_year_desc
         FROM retail_detail rd
     )
 
@@ -1009,231 +977,208 @@ $$
         retail_month_full_year_desc
     FROM retail_detail_extended
     ORDER BY date
-$$;
+    ';
 
+    -- Execute the SQL
+    BEGIN
+        EXECUTE IMMEDIATE sql_command;
+    EXCEPTION
+        WHEN OTHER THEN
+            status := 'ERROR: ' || SQLERRM;
+    END;
+
+    RETURN status;
+END;
+$$;
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
--- STEP 6: Create the stored procedure to build the business calendar
+-- Step 6: Create helper functions, procedures, and the configuration-driven business calendar system
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-CREATE OR REPLACE PROCEDURE SPG_DAP01.PBI.SP_BUILD_BUSINESS_CALENDAR(
-    start_date DATE DEFAULT '2015-01-01',
-    end_date DATE DEFAULT '2035-12-31',
-    date_grain STRING DEFAULT 'DAY',
-    timezone STRING DEFAULT 'Australia/Adelaide',
-    include_gregorian BOOLEAN DEFAULT TRUE,
-    include_au_fiscal BOOLEAN DEFAULT TRUE,
-    include_retail_calendar BOOLEAN DEFAULT TRUE,
-    retail_calendar_type STRING DEFAULT '445'
+
+-- 1. Create helper function for managing columns
+CREATE OR REPLACE FUNCTION SPG_DAP01.PBI.FN_ENSURE_COLUMNS_EXIST(
+    table_name STRING,
+    column_definitions ARRAY
 )
 RETURNS STRING
 LANGUAGE SQL
 AS
 $$
 DECLARE
-    status_message STRING DEFAULT 'SUCCESS';
-    current_run_ts TIMESTAMP_LTZ(9);
+    columns_to_add ARRAY DEFAULT [];
+    col_def OBJECT;
+    col_exists BOOLEAN;
+    alter_sql STRING;
 BEGIN
-    -- Set the session timezone
-    EXECUTE IMMEDIATE 'ALTER SESSION SET TIMEZONE = ''' || timezone || '''';
+    -- Check which columns need to be added
+    FOR col_def IN (SELECT VALUE FROM (SELECT ARRAY_AGG(OBJECT_CONSTRUCT(*)) FROM TABLE(FLATTEN(input => column_definitions))))
+    DO
+        col_exists := (SYSTEM$TYPEOF(col_def:name || ' in ' || table_name) != 'UNDEFINED');
+        IF NOT col_exists THEN
+            columns_to_add := ARRAY_APPEND(columns_to_add, col_def);
+        END IF;
+    END FOR;
 
-    -- Get current timestamp after timezone is set
-    current_run_ts := CURRENT_TIMESTAMP();
+    -- Nothing to add
+    IF ARRAY_SIZE(columns_to_add) = 0 THEN
+        RETURN 'All columns already exist';
+    END IF;
 
-    -- 1. Generate the base Gregorian calendar
-    CREATE OR REPLACE TABLE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE AS
-    SELECT * FROM TABLE(SPG_DAP01.PBI.FN_GENERATE_GREGORIAN_CALENDAR(
-        :start_date, :end_date, :date_grain, :timezone
+    -- Build ALTER TABLE statement
+    alter_sql := 'ALTER TABLE ' || table_name || ' ADD ';
+    FOR i IN 0 TO ARRAY_SIZE(columns_to_add)-1 DO
+        col_def := columns_to_add[i];
+        alter_sql := alter_sql || col_def:name || ' ' || col_def:type;
+        IF i < ARRAY_SIZE(columns_to_add)-1 THEN
+            alter_sql := alter_sql || ', ';
+        END IF;
+    END FOR;
+
+    -- Execute ALTER TABLE
+    EXECUTE IMMEDIATE alter_sql;
+
+    RETURN 'Added ' || ARRAY_SIZE(columns_to_add) || ' columns';
+END;
+$$;
+
+-- 2. Create helper procedure for processing calendar modules
+CREATE OR REPLACE PROCEDURE SPG_DAP01.PBI.PR_PROCESS_CALENDAR_MODULE(
+    module_name STRING,
+    temp_table_name STRING,
+    function_name STRING,
+    function_parameters OBJECT,
+    base_table_name STRING,
+    column_mapping ARRAY
+)
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+DECLARE
+    function_call STRING;
+    update_sql STRING;
+    column_definitions ARRAY;
+    result STRING;
+BEGIN
+    -- Build function call to create temp table
+    function_call := 'CREATE OR REPLACE TEMPORARY TABLE ' || temp_table_name || ' AS SELECT * FROM TABLE(' ||
+                     function_name || '(';
+
+    -- Add function parameters
+    FOR i IN 0 TO ARRAY_SIZE(OBJECT_KEYS(function_parameters))-1 DO
+        IF i > 0 THEN
+            function_call := function_call || ', ';
+        END IF;
+        function_call := function_call || function_parameters[OBJECT_KEYS(function_parameters)[i]];
+    END FOR;
+
+    function_call := function_call || '))';
+
+    -- Execute function to create temp table
+    EXECUTE IMMEDIATE function_call;
+
+    -- Extract column definitions for ensuring columns exist
+    column_definitions := [];
+    FOR mapping IN (SELECT VALUE FROM (SELECT ARRAY_AGG(OBJECT_CONSTRUCT(*)) FROM TABLE(FLATTEN(input => column_mapping))))
+    DO
+        column_definitions := ARRAY_APPEND(column_definitions,
+            OBJECT_CONSTRUCT('name', mapping:target_column, 'type', mapping:type));
+    END FOR;
+
+    -- Ensure columns exist in base table
+    result := SPG_DAP01.PBI.FN_ENSURE_COLUMNS_EXIST(base_table_name, column_definitions);
+
+    -- Build update SQL
+    update_sql := 'UPDATE ' || base_table_name || ' b SET ';
+
+    FOR i IN 0 TO ARRAY_SIZE(column_mapping)-1 DO
+        IF i > 0 THEN
+            update_sql := update_sql || ', ';
+        END IF;
+        update_sql := update_sql || column_mapping[i]:target_column || ' = t.' || column_mapping[i]:source_column;
+    END FOR;
+
+    update_sql := update_sql || ' FROM ' || temp_table_name || ' t WHERE b.date = t.date';
+
+    -- Execute update
+    EXECUTE IMMEDIATE update_sql;
+
+    -- Drop temp table
+    EXECUTE IMMEDIATE 'DROP TABLE IF EXISTS ' || temp_table_name;
+
+    RETURN 'Successfully processed ' || module_name || ' calendar module';
+END;
+$$;
+
+-- 3. Create holidays processing procedure
+CREATE OR REPLACE PROCEDURE SPG_DAP01.PBI.PR_PROCESS_HOLIDAYS(
+    date_spine_table STRING,
+    target_table STRING
+)
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+DECLARE
+    result STRING;
+BEGIN
+    -- Create temporary table with holiday data
+    CREATE TEMPORARY TABLE temp_holidays AS
+    SELECT * FROM TABLE(SPG_DAP01.PBI.FN_PROCESS_HOLIDAYS(:date_spine_table));
+
+    -- Define column definitions for holiday flags
+    result := SPG_DAP01.PBI.FN_ENSURE_COLUMNS_EXIST(:target_table, ARRAY_CONSTRUCT(
+        OBJECT_CONSTRUCT('name', 'is_holiday', 'type', 'NUMBER(1,0)'),
+        OBJECT_CONSTRUCT('name', 'holiday_indicator', 'type', 'STRING'),
+        OBJECT_CONSTRUCT('name', 'holiday_desc', 'type', 'STRING'),
+        OBJECT_CONSTRUCT('name', 'is_holiday_nsw', 'type', 'NUMBER(1,0)'),
+        OBJECT_CONSTRUCT('name', 'is_holiday_vic', 'type', 'NUMBER(1,0)'),
+        OBJECT_CONSTRUCT('name', 'is_holiday_qld', 'type', 'NUMBER(1,0)'),
+        OBJECT_CONSTRUCT('name', 'is_holiday_sa', 'type', 'NUMBER(1,0)'),
+        OBJECT_CONSTRUCT('name', 'is_holiday_wa', 'type', 'NUMBER(1,0)'),
+        OBJECT_CONSTRUCT('name', 'is_holiday_tas', 'type', 'NUMBER(1,0)'),
+        OBJECT_CONSTRUCT('name', 'is_holiday_act', 'type', 'NUMBER(1,0)'),
+        OBJECT_CONSTRUCT('name', 'is_holiday_nt', 'type', 'NUMBER(1,0)'),
+        OBJECT_CONSTRUCT('name', 'is_holiday_national', 'type', 'NUMBER(1,0)')
     ));
 
-    -- 2. Create a temp table to store this calendar for processing by other functions
-    CREATE OR REPLACE TEMPORARY TABLE date_spine_table AS
-    SELECT date AS calendar_date
-    FROM SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE;
-
-    -- 3. Apply holiday processing to add holiday flags
-    CREATE TEMPORARY TABLE temp_holidays AS
-    SELECT * FROM TABLE(SPG_DAP01.PBI.FN_PROCESS_HOLIDAYS('date_spine_table'));
-
-    -- 4. Join the Gregorian calendar with holiday data
-    UPDATE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b
+    -- Update the main table with holiday data
+    EXECUTE IMMEDIATE 'UPDATE ' || :target_table || ' b
     SET
         is_holiday = h.is_holiday,
         holiday_indicator = h.holiday_indicator,
         holiday_desc = h.holiday_desc,
-        is_holiday_nsw = h.is_holiday_nsw,
-        is_holiday_vic = h.is_holiday_vic,
-        is_holiday_qld = h.is_holiday_qld,
-        is_holiday_sa = h.is_holiday_sa,
-        is_holiday_wa = h.is_holiday_wa,
-        is_holiday_tas = h.is_holiday_tas,
-        is_holiday_act = h.is_holiday_act,
-        is_holiday_nt = h.is_holiday_nt,
-        is_holiday_national = h.is_holiday_national
+        is_holiday_nsw = h.holiday_metadata:is_holiday_nsw,
+        is_holiday_vic = h.holiday_metadata:is_holiday_vic,
+        is_holiday_qld = h.holiday_metadata:is_holiday_qld,
+        is_holiday_sa = h.holiday_metadata:is_holiday_sa,
+        is_holiday_wa = h.holiday_metadata:is_holiday_wa,
+        is_holiday_tas = h.holiday_metadata:is_holiday_tas,
+        is_holiday_act = h.holiday_metadata:is_holiday_act,
+        is_holiday_nt = h.holiday_metadata:is_holiday_nt,
+        is_holiday_national = h.holiday_metadata:is_holiday_national
     FROM temp_holidays h
-    WHERE b.date = h.date;
+    WHERE b.date = h.date';
 
-    -- 5. Add AU Fiscal calendar if requested
-    IF (include_au_fiscal) THEN
-        -- Generate AU Fiscal calendar
-        CREATE TEMPORARY TABLE temp_au_fiscal AS
-        SELECT * FROM TABLE(SPG_DAP01.PBI.FN_GENERATE_AU_FISCAL_CALENDAR(
-            'date_spine_table'
-        ));
+    -- Drop temporary table
+    DROP TABLE IF EXISTS temp_holidays;
 
-        -- Check if fiscal calendar columns exist
-        BEGIN TRY
-            -- Join AU Fiscal data to base calendar
-            UPDATE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b
-            SET
-                au_fiscal_start_date_for_year = f.au_fiscal_start_date_for_year,
-                au_fiscal_end_date_for_year = f.au_fiscal_end_date_for_year,
-                au_fiscal_year_num = f.au_fiscal_year_num,
-                au_fiscal_year_desc = f.au_fiscal_year_desc,
-                au_fiscal_quarter_num = f.au_fiscal_quarter_num,
-                au_fiscal_quarter_year_key = f.au_fiscal_quarter_year_key,
-                au_fiscal_quarter_desc = f.au_fiscal_quarter_desc,
-                au_fiscal_quarter_start_date = f.au_fiscal_quarter_start_date,
-                au_fiscal_quarter_end_date = f.au_fiscal_quarter_end_date,
-                au_fiscal_month_num = f.au_fiscal_month_num,
-                au_fiscal_month_year_key = f.au_fiscal_month_year_key,
-                au_fiscal_month_desc = f.au_fiscal_month_desc,
-                au_fiscal_month_start_date = f.au_fiscal_month_start_date,
-                au_fiscal_month_end_date = f.au_fiscal_month_end_date,
-                au_fiscal_week_num = f.au_fiscal_week_num,
-                same_business_day_last_year = f.same_business_day_last_year
-            FROM temp_au_fiscal f
-            WHERE b.date = f.date;
-        EXCEPTION
-            WHEN OTHER THEN
-                -- Add the AU fiscal calendar columns first, then update
-                ALTER TABLE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE ADD
-                    au_fiscal_start_date_for_year DATE,
-                    au_fiscal_end_date_for_year DATE,
-                    au_fiscal_year_num NUMBER,
-                    au_fiscal_year_desc STRING,
-                    au_fiscal_quarter_num NUMBER,
-                    au_fiscal_quarter_year_key NUMBER,
-                    au_fiscal_quarter_desc STRING,
-                    au_fiscal_quarter_start_date DATE,
-                    au_fiscal_quarter_end_date DATE,
-                    au_fiscal_month_num NUMBER,
-                    au_fiscal_month_year_key NUMBER,
-                    au_fiscal_month_desc STRING,
-                    au_fiscal_month_start_date DATE,
-                    au_fiscal_month_end_date DATE,
-                    au_fiscal_week_num NUMBER,
-                    same_business_day_last_year DATE;
+    RETURN 'Successfully processed holiday data';
+END;
+$$;
 
-                -- Now update with AU fiscal calendar details
-                UPDATE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b
-                SET
-                    au_fiscal_start_date_for_year = f.au_fiscal_start_date_for_year,
-                    au_fiscal_end_date_for_year = f.au_fiscal_end_date_for_year,
-                    au_fiscal_year_num = f.au_fiscal_year_num,
-                    au_fiscal_year_desc = f.au_fiscal_year_desc,
-                    au_fiscal_quarter_num = f.au_fiscal_quarter_num,
-                    au_fiscal_quarter_year_key = f.au_fiscal_quarter_year_key,
-                    au_fiscal_quarter_desc = f.au_fiscal_quarter_desc,
-                    au_fiscal_quarter_start_date = f.au_fiscal_quarter_start_date,
-                    au_fiscal_quarter_end_date = f.au_fiscal_quarter_end_date,
-                    au_fiscal_month_num = f.au_fiscal_month_num,
-                    au_fiscal_month_year_key = f.au_fiscal_month_year_key,
-                    au_fiscal_month_desc = f.au_fiscal_month_desc,
-                    au_fiscal_month_start_date = f.au_fiscal_month_start_date,
-                    au_fiscal_month_end_date = f.au_fiscal_month_end_date,
-                    au_fiscal_week_num = f.au_fiscal_week_num,
-                    same_business_day_last_year = f.same_business_day_last_year
-                FROM temp_au_fiscal f
-                WHERE b.date = f.date;
-        END;
-
-        -- Drop the temporary table
-        DROP TABLE IF EXISTS temp_au_fiscal;
-    END IF;
-
-    -- 6. Add Retail calendar if requested
-    IF (include_retail_calendar) THEN
-        -- Generate Retail calendar based on selected pattern
-        CREATE TEMPORARY TABLE temp_retail AS
-        SELECT * FROM TABLE(SPG_DAP01.PBI.FN_GENERATE_RETAIL_CALENDAR(
-            'date_spine_table',
-            :retail_calendar_type
-        ));
-
-        -- Add retail calendar columns if they don't exist
-        BEGIN TRY
-            -- Update the main calendar table with retail calendar data
-            UPDATE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b
-            SET
-                retail_start_of_year = r.retail_start_of_year,
-                retail_end_of_year = r.retail_end_of_year,
-                retail_year_num = r.retail_year_num,
-                retail_year_desc = r.retail_year_desc,
-                retail_week_num = r.retail_week_num,
-                retail_half_num = r.retail_half_num,
-                retail_half_desc = r.retail_half_desc,
-                retail_quarter_num = r.retail_quarter_num,
-                retail_quarter_desc = r.retail_quarter_desc,
-                retail_quarter_year_key = r.retail_quarter_year_key,
-                retail_period_num = r.retail_period_num,
-                retail_period_desc = r.retail_period_desc,
-                retail_year_month_key = r.retail_year_month_key,
-                retail_month_short_name = r.retail_month_short_name,
-                retail_month_long_name = r.retail_month_long_name,
-                retail_month_year_desc = r.retail_month_year_desc,
-                retail_month_full_year_desc = r.retail_month_full_year_desc
-            FROM temp_retail r
-            WHERE b.date = r.date;
-        EXCEPTION
-            WHEN OTHER THEN
-                -- Add the retail calendar columns first, then update
-                ALTER TABLE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE ADD
-                    retail_start_of_year DATE,
-                    retail_end_of_year DATE,
-                    retail_year_num NUMBER,
-                    retail_year_desc STRING,
-                    retail_week_num NUMBER,
-                    retail_half_num NUMBER,
-                    retail_half_desc STRING,
-                    retail_quarter_num NUMBER,
-                    retail_quarter_desc STRING,
-                    retail_quarter_year_key NUMBER,
-                    retail_period_num NUMBER,
-                    retail_period_desc STRING,
-                    retail_year_month_key NUMBER,
-                    retail_month_short_name STRING,
-                    retail_month_long_name STRING,
-                    retail_month_year_desc STRING,
-                    retail_month_full_year_desc STRING;
-
-                -- Now update with retail calendar details
-                UPDATE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b
-                SET
-                    retail_start_of_year = r.retail_start_of_year,
-                    retail_end_of_year = r.retail_end_of_year,
-                    retail_year_num = r.retail_year_num,
-                    retail_year_desc = r.retail_year_desc,
-                    retail_week_num = r.retail_week_num,
-                    retail_half_num = r.retail_half_num,
-                    retail_half_desc = r.retail_half_desc,
-                    retail_quarter_num = r.retail_quarter_num,
-                    retail_quarter_desc = r.retail_quarter_desc,
-                    retail_quarter_year_key = r.retail_quarter_year_key,
-                    retail_period_num = r.retail_period_num,
-                    retail_period_desc = r.retail_period_desc,
-                    retail_year_month_key = r.retail_year_month_key,
-                    retail_month_short_name = r.retail_month_short_name,
-                    retail_month_long_name = r.retail_month_long_name,
-                    retail_month_year_desc = r.retail_month_year_desc,
-                    retail_month_full_year_desc = r.retail_month_full_year_desc
-                FROM temp_retail r
-                WHERE b.date = r.date;
-        END;
-
-        -- Drop the temporary table
-        DROP TABLE IF EXISTS temp_retail;
-    END IF;
-
-    -- 7. Calculate trading days
+-- 4. Create trading days processing procedure
+CREATE OR REPLACE PROCEDURE SPG_DAP01.PBI.PR_PROCESS_TRADING_DAYS(
+    date_spine_table STRING,
+    target_table STRING
+)
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+DECLARE
+    result STRING;
+BEGIN
+    -- Create temporary table with trading day calculations
     CREATE TEMPORARY TABLE temp_trading_days AS
     WITH trading_day_calendar AS (
         SELECT
@@ -1258,111 +1203,103 @@ BEGIN
             LEAD(CASE WHEN is_weekday = 1 AND is_holiday = 0 THEN date END) OVER (ORDER BY date) AS next_trading_date,
             SUM(CASE WHEN is_weekday = 1 AND is_holiday = 0 THEN 1 ELSE 0 END) OVER (PARTITION BY year_month_key) AS trading_days_in_month,
             SUM(CASE WHEN is_weekday = 1 AND is_holiday = 0 THEN 1 ELSE 0 END) OVER (PARTITION BY year_quarter_key) AS trading_days_in_quarter
-        FROM SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE
+        FROM identifier(:target_table)
     )
     SELECT
         tdc.*,
-        -- Add fiscal calendar trading days if fiscal calendar is included
-        CASE WHEN :include_au_fiscal AND COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'AU_FISCAL_MONTH_YEAR_KEY') = 'YES' THEN
+        -- Add fiscal calendar trading days if fiscal calendar exists
+        CASE WHEN EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = UPPER(:target_table) AND column_name = 'AU_FISCAL_MONTH_YEAR_KEY') THEN
             SUM(CASE WHEN tdc.is_weekday = 1 AND tdc.is_holiday = 0 THEN 1 ELSE 0 END)
                 OVER (PARTITION BY b.au_fiscal_month_year_key)
         ELSE NULL END AS trading_days_in_au_fiscal_month,
 
-        CASE WHEN :include_au_fiscal AND COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'AU_FISCAL_QUARTER_YEAR_KEY') = 'YES' THEN
+        CASE WHEN EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = UPPER(:target_table) AND column_name = 'AU_FISCAL_QUARTER_YEAR_KEY') THEN
             SUM(CASE WHEN tdc.is_weekday = 1 AND tdc.is_holiday = 0 THEN 1 ELSE 0 END)
                 OVER (PARTITION BY b.au_fiscal_quarter_year_key)
         ELSE NULL END AS trading_days_in_au_fiscal_quarter,
 
-        -- Add retail calendar trading days if retail calendar is included
-        CASE WHEN :include_retail_calendar AND COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_YEAR_MONTH_KEY') = 'YES' THEN
+        -- Add retail calendar trading days if retail calendar exists
+        CASE WHEN EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = UPPER(:target_table) AND column_name = 'RETAIL_YEAR_MONTH_KEY') THEN
             SUM(CASE WHEN tdc.is_weekday = 1 AND tdc.is_holiday = 0 THEN 1 ELSE 0 END)
                 OVER (PARTITION BY b.retail_year_month_key)
         ELSE NULL END AS trading_days_in_retail_period,
 
-        CASE WHEN :include_retail_calendar AND COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_QUARTER_YEAR_KEY') = 'YES' THEN
+        CASE WHEN EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = UPPER(:target_table) AND column_name = 'RETAIL_QUARTER_YEAR_KEY') THEN
             SUM(CASE WHEN tdc.is_weekday = 1 AND tdc.is_holiday = 0 THEN 1 ELSE 0 END)
                 OVER (PARTITION BY b.retail_quarter_year_key)
         ELSE NULL END AS trading_days_in_retail_quarter
     FROM trading_day_calendar tdc
-    JOIN SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b ON tdc.date = b.date;
+    JOIN identifier(:target_table) b ON tdc.date = b.date;
 
-    -- Update the main calendar table with trading day details
-    BEGIN TRY
-        UPDATE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b
-        SET
-            is_trading_day = t.is_trading_day,
-            trading_day_desc = t.trading_day_desc,
-            day_of_month_seq = t.day_of_month_seq,
-            trading_day_of_month_seq = t.trading_day_of_month_seq,
-            is_first_day_of_month = t.is_first_day_of_month,
-            is_last_day_of_month = t.is_last_day_of_month,
-            is_first_day_of_quarter = t.is_first_day_of_quarter,
-            is_last_day_of_quarter = t.is_last_day_of_quarter,
-            next_date = t.next_date,
-            previous_date = t.previous_date,
-            next_trading_date = t.next_trading_date,
-            previous_trading_date = t.previous_trading_date,
-            trading_days_in_month = t.trading_days_in_month,
-            trading_days_in_quarter = t.trading_days_in_quarter,
-            trading_days_in_au_fiscal_month = t.trading_days_in_au_fiscal_month,
-            trading_days_in_au_fiscal_quarter = t.trading_days_in_au_fiscal_quarter,
-            trading_days_in_retail_period = t.trading_days_in_retail_period,
-            trading_days_in_retail_quarter = t.trading_days_in_retail_quarter
-        FROM temp_trading_days t
-        WHERE b.date = t.date;
-    EXCEPTION
-        WHEN OTHER THEN
-            -- Add the trading day columns first, then update
-            ALTER TABLE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE ADD
-                is_trading_day NUMBER(1,0),
-                trading_day_desc STRING,
-                day_of_month_seq NUMBER,
-                trading_day_of_month_seq NUMBER,
-                is_first_day_of_month NUMBER(1,0),
-                is_last_day_of_month NUMBER(1,0),
-                is_first_day_of_quarter NUMBER(1,0),
-                is_last_day_of_quarter NUMBER(1,0),
-                next_date DATE,
-                previous_date DATE,
-                next_trading_date DATE,
-                previous_trading_date DATE,
-                trading_days_in_month NUMBER,
-                trading_days_in_quarter NUMBER,
-                trading_days_in_au_fiscal_month NUMBER,
-                trading_days_in_au_fiscal_quarter NUMBER,
-                trading_days_in_retail_period NUMBER,
-                trading_days_in_retail_quarter NUMBER;
+    -- Define column definitions for trading days
+    result := SPG_DAP01.PBI.FN_ENSURE_COLUMNS_EXIST(:target_table, ARRAY_CONSTRUCT(
+        OBJECT_CONSTRUCT('name', 'is_trading_day', 'type', 'NUMBER(1,0)'),
+        OBJECT_CONSTRUCT('name', 'trading_day_desc', 'type', 'STRING'),
+        OBJECT_CONSTRUCT('name', 'day_of_month_seq', 'type', 'NUMBER'),
+        OBJECT_CONSTRUCT('name', 'trading_day_of_month_seq', 'type', 'NUMBER'),
+        OBJECT_CONSTRUCT('name', 'is_first_day_of_month', 'type', 'NUMBER(1,0)'),
+        OBJECT_CONSTRUCT('name', 'is_last_day_of_month', 'type', 'NUMBER(1,0)'),
+        OBJECT_CONSTRUCT('name', 'is_first_day_of_quarter', 'type', 'NUMBER(1,0)'),
+        OBJECT_CONSTRUCT('name', 'is_last_day_of_quarter', 'type', 'NUMBER(1,0)'),
+        OBJECT_CONSTRUCT('name', 'next_date', 'type', 'DATE'),
+        OBJECT_CONSTRUCT('name', 'previous_date', 'type', 'DATE'),
+        OBJECT_CONSTRUCT('name', 'next_trading_date', 'type', 'DATE'),
+        OBJECT_CONSTRUCT('name', 'previous_trading_date', 'type', 'DATE'),
+        OBJECT_CONSTRUCT('name', 'trading_days_in_month', 'type', 'NUMBER'),
+        OBJECT_CONSTRUCT('name', 'trading_days_in_quarter', 'type', 'NUMBER'),
+        OBJECT_CONSTRUCT('name', 'trading_days_in_au_fiscal_month', 'type', 'NUMBER'),
+        OBJECT_CONSTRUCT('name', 'trading_days_in_au_fiscal_quarter', 'type', 'NUMBER'),
+        OBJECT_CONSTRUCT('name', 'trading_days_in_retail_period', 'type', 'NUMBER'),
+        OBJECT_CONSTRUCT('name', 'trading_days_in_retail_quarter', 'type', 'NUMBER')
+    ));
 
-            -- Now update with trading day details
-            UPDATE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b
-            SET
-                is_trading_day = t.is_trading_day,
-                trading_day_desc = t.trading_day_desc,
-                day_of_month_seq = t.day_of_month_seq,
-                trading_day_of_month_seq = t.trading_day_of_month_seq,
-                is_first_day_of_month = t.is_first_day_of_month,
-                is_last_day_of_month = t.is_last_day_of_month,
-                is_first_day_of_quarter = t.is_first_day_of_quarter,
-                is_last_day_of_quarter = t.is_last_day_of_quarter,
-                next_date = t.next_date,
-                previous_date = t.previous_date,
-                next_trading_date = t.next_trading_date,
-                previous_trading_date = t.previous_trading_date,
-                trading_days_in_month = t.trading_days_in_month,
-                trading_days_in_quarter = t.trading_days_in_quarter,
-                trading_days_in_au_fiscal_month = t.trading_days_in_au_fiscal_month,
-                trading_days_in_au_fiscal_quarter = t.trading_days_in_au_fiscal_quarter,
-                trading_days_in_retail_period = t.trading_days_in_retail_period,
-                trading_days_in_retail_quarter = t.trading_days_in_retail_quarter
-            FROM temp_trading_days t
-            WHERE b.date = t.date;
-    END;
+    -- Update the main table with trading day data
+    EXECUTE IMMEDIATE 'UPDATE ' || :target_table || ' b
+    SET
+        is_trading_day = t.is_trading_day,
+        trading_day_desc = t.trading_day_desc,
+        day_of_month_seq = t.day_of_month_seq,
+        trading_day_of_month_seq = t.trading_day_of_month_seq,
+        is_first_day_of_month = t.is_first_day_of_month,
+        is_last_day_of_month = t.is_last_day_of_month,
+        is_first_day_of_quarter = t.is_first_day_of_quarter,
+        is_last_day_of_quarter = t.is_last_day_of_quarter,
+        next_date = t.next_date,
+        previous_date = t.previous_date,
+        next_trading_date = t.next_trading_date,
+        previous_trading_date = t.previous_trading_date,
+        trading_days_in_month = t.trading_days_in_month,
+        trading_days_in_quarter = t.trading_days_in_quarter,
+        trading_days_in_au_fiscal_month = t.trading_days_in_au_fiscal_month,
+        trading_days_in_au_fiscal_quarter = t.trading_days_in_au_fiscal_quarter,
+        trading_days_in_retail_period = t.trading_days_in_retail_period,
+        trading_days_in_retail_quarter = t.trading_days_in_retail_quarter
+    FROM temp_trading_days t
+    WHERE b.date = t.date';
 
-    -- 8. Add retail seasons
+    -- Drop temporary table
+    DROP TABLE IF EXISTS temp_trading_days;
+
+    RETURN 'Successfully processed trading day data';
+END;
+$$;
+
+-- 5. Create retail seasons processing procedure
+CREATE OR REPLACE PROCEDURE SPG_DAP01.PBI.PR_PROCESS_RETAIL_SEASONS(
+    target_table STRING
+)
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+DECLARE
+    result STRING;
+BEGIN
+    -- Create temporary table with retail season calculations
     CREATE TEMPORARY TABLE temp_retail_seasons AS
     WITH good_fridays AS (
          SELECT year_num, MIN(date) as good_friday_date
-         FROM SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE
+         FROM identifier(:target_table)
          WHERE is_holiday = 1 AND month_num IN (3, 4) AND day_long_name = 'Friday'
          GROUP BY year_num
     ),
@@ -1382,63 +1319,47 @@ BEGIN
                 WHEN bc.month_num = 12 AND bc.day_of_month_num BETWEEN 27 AND 31 THEN 'Post-Christmas Sale'
                 ELSE NULL
             END AS holiday_proximity
-        FROM SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE bc
+        FROM identifier(:target_table) bc
         LEFT JOIN good_fridays gf ON bc.year_num = gf.year_num
     );
 
-    -- Update the main calendar table with retail seasons
-    BEGIN TRY
-        UPDATE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b
-        SET
-            retail_season = rs.retail_season,
-            holiday_proximity = rs.holiday_proximity
-        FROM temp_retail_seasons rs
-        WHERE b.date = rs.date;
-    EXCEPTION
-        WHEN OTHER THEN
-            -- Add the retail seasons columns first, then update
-            ALTER TABLE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE ADD
-                retail_season STRING,
-                holiday_proximity STRING;
+    -- Define column definitions for retail seasons
+    result := SPG_DAP01.PBI.FN_ENSURE_COLUMNS_EXIST(:target_table, ARRAY_CONSTRUCT(
+        OBJECT_CONSTRUCT('name', 'retail_season', 'type', 'STRING'),
+        OBJECT_CONSTRUCT('name', 'holiday_proximity', 'type', 'STRING')
+    ));
 
-            -- Now update with retail seasons
-            UPDATE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b
-            SET
-                retail_season = rs.retail_season,
-                holiday_proximity = rs.holiday_proximity
-            FROM temp_retail_seasons rs
-            WHERE b.date = rs.date;
-    END;
+    -- Update the main table with retail season data
+    EXECUTE IMMEDIATE 'UPDATE ' || :target_table || ' b
+    SET
+        retail_season = rs.retail_season,
+        holiday_proximity = rs.holiday_proximity
+    FROM temp_retail_seasons rs
+    WHERE b.date = rs.date';
 
-    -- 9. Add metadata
-    BEGIN TRY
-        UPDATE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE
-        SET
-            dw_created_ts = :current_run_ts,
-            dw_source_system = 'SP_BUILD_BUSINESS_CALENDAR',
-            dw_version_desc = 'v2.0 - Parameterised calendar generation with modules';
-    EXCEPTION
-        WHEN OTHER THEN
-            -- Add the metadata columns first, then update
-            ALTER TABLE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE ADD
-                dw_created_ts TIMESTAMP_LTZ,
-                dw_source_system STRING,
-                dw_version_desc STRING;
+    -- Drop temporary table
+    DROP TABLE IF EXISTS temp_retail_seasons;
 
-            -- Now update metadata
-            UPDATE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE
-            SET
-                dw_created_ts = :current_run_ts,
-                dw_source_system = 'SP_BUILD_BUSINESS_CALENDAR',
-                dw_version_desc = 'v2.0 - Parameterised calendar generation with modules';
-    END;
+    RETURN 'Successfully processed retail season data';
+END;
+$$;
 
-    -- 10. Add clustering
-    ALTER TABLE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE CLUSTER BY (date);
-
-    -- 11. Create the dynamic calendar view with relative time flags
-    EXECUTE IMMEDIATE '
-    CREATE OR REPLACE VIEW SPG_DAP01.PBI.BUSINESS_CALENDAR
+-- 6. Create calendar view generation procedure
+CREATE OR REPLACE PROCEDURE SPG_DAP01.PBI.PR_CREATE_CALENDAR_VIEW(
+    base_table STRING,
+    view_name STRING,
+    components ARRAY
+)
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+DECLARE
+    view_sql STRING;
+BEGIN
+    -- Define the dynamic calendar view SQL
+    view_sql := '
+    CREATE OR REPLACE VIEW ' || view_name || '
     AS
     WITH current_values AS (
         -- Pre-calculate values based on CURRENT_DATE() once for efficiency in the view
@@ -1447,26 +1368,25 @@ BEGIN
             DATE_TRUNC(''MONTH'', CURRENT_DATE()) AS current_month_start,
             DATE_TRUNC(''QUARTER'', CURRENT_DATE()) AS current_quarter_start,
             DATE_TRUNC(''YEAR'', CURRENT_DATE()) AS current_year_start,
-            (SELECT MAX(b.year_month_key) FROM SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b WHERE b.date < DATE_TRUNC(''MONTH'', CURRENT_DATE())) AS prev_month_key,
-            (SELECT MAX(b.year_quarter_key) FROM SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b WHERE b.date < DATE_TRUNC(''QUARTER'', CURRENT_DATE())) AS prev_quarter_key,
+            (SELECT MAX(b.year_month_key) FROM ' || base_table || ' b WHERE b.date < DATE_TRUNC(''MONTH'', CURRENT_DATE())) AS prev_month_key,
+            (SELECT MAX(b.year_quarter_key) FROM ' || base_table || ' b WHERE b.date < DATE_TRUNC(''QUARTER'', CURRENT_DATE())) AS prev_quarter_key';
 
-            -- Handle case where fiscal calendar columns might not exist
-            (SELECT CASE WHEN COL_EXISTS(''SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE'', ''AU_FISCAL_YEAR_NUM'') = ''YES'' THEN
-                (SELECT b.au_fiscal_year_num FROM SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b WHERE b.date = CURRENT_DATE())
-             ELSE NULL END) AS current_au_fiscal_year_num,
+    -- Add AU Fiscal calendar current values if included
+    IF ARRAY_CONTAINS('AU_FISCAL'::VARIANT, components) THEN
+        view_sql := view_sql || ',
+            (SELECT b.au_fiscal_year_num FROM ' || base_table || ' b WHERE b.date = CURRENT_DATE()) AS current_au_fiscal_year_num,
+            (SELECT b.au_fiscal_start_date_for_year FROM ' || base_table || ' b WHERE b.date = CURRENT_DATE()) AS current_au_fiscal_start_date';
+    END IF;
 
-            (SELECT CASE WHEN COL_EXISTS(''SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE'', ''AU_FISCAL_START_DATE_FOR_YEAR'') = ''YES'' THEN
-                (SELECT b.au_fiscal_start_date_for_year FROM SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b WHERE b.date = CURRENT_DATE())
-             ELSE NULL END) AS current_au_fiscal_start_date,
+    -- Add Retail calendar current values if included
+    IF ARRAY_CONTAINS('RETAIL'::VARIANT, components) THEN
+        view_sql := view_sql || ',
+            (SELECT b.retail_year_num FROM ' || base_table || ' b WHERE b.date = CURRENT_DATE()) AS current_retail_year_num,
+            (SELECT b.retail_start_of_year FROM ' || base_table || ' b WHERE b.date = CURRENT_DATE()) AS current_retail_start_of_year';
+    END IF;
 
-            -- Retail calendar current values if they exist
-            (SELECT CASE WHEN COL_EXISTS(''SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE'', ''RETAIL_YEAR_NUM'') = ''YES'' THEN
-                (SELECT b.retail_year_num FROM SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b WHERE b.date = CURRENT_DATE())
-             ELSE NULL END) AS current_retail_year_num,
-
-            (SELECT CASE WHEN COL_EXISTS(''SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE'', ''RETAIL_START_OF_YEAR'') = ''YES'' THEN
-                (SELECT b.retail_start_of_year FROM SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b WHERE b.date = CURRENT_DATE())
-             ELSE NULL END) AS current_retail_start_of_year
+    -- Complete the WITH clause
+    view_sql := view_sql || '
     )
     SELECT
         -- Basic Gregorian calendar columns (always included)
@@ -1544,98 +1464,65 @@ BEGIN
         base.next_trading_date,
         base.previous_trading_date,
         base.trading_days_in_month,
-        base.trading_days_in_quarter,
+        base.trading_days_in_quarter';
 
-        -- AU Fiscal columns (conditionally included)
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'AU_FISCAL_YEAR_NUM') = 'YES'
-            THEN base.au_fiscal_year_num ELSE NULL END AS au_fiscal_year_num,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'AU_FISCAL_YEAR_DESC') = 'YES'
-            THEN base.au_fiscal_year_desc ELSE NULL END AS au_fiscal_year_desc,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'AU_FISCAL_QUARTER_NUM') = 'YES'
-            THEN base.au_fiscal_quarter_num ELSE NULL END AS au_fiscal_quarter_num,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'AU_FISCAL_QUARTER_DESC') = 'YES'
-            THEN base.au_fiscal_quarter_desc ELSE NULL END AS au_fiscal_quarter_desc,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'AU_FISCAL_QUARTER_YEAR_KEY') = 'YES'
-            THEN base.au_fiscal_quarter_year_key ELSE NULL END AS au_fiscal_quarter_year_key,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'AU_FISCAL_QUARTER_NUM') = 'YES'
-            THEN base.au_fiscal_quarter_num ELSE NULL END AS au_fiscal_quarter_sort_key,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'AU_FISCAL_MONTH_NUM') = 'YES'
-            THEN base.au_fiscal_month_num ELSE NULL END AS au_fiscal_month_num,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'AU_FISCAL_MONTH_DESC') = 'YES'
-            THEN base.au_fiscal_month_desc ELSE NULL END AS au_fiscal_month_desc,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'AU_FISCAL_MONTH_YEAR_KEY') = 'YES'
-            THEN base.au_fiscal_month_year_key ELSE NULL END AS au_fiscal_month_year_key,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'AU_FISCAL_MONTH_NUM') = 'YES'
-            THEN base.au_fiscal_month_num ELSE NULL END AS au_fiscal_month_sort_key,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'AU_FISCAL_WEEK_NUM') = 'YES'
-            THEN base.au_fiscal_week_num ELSE NULL END AS au_fiscal_week_num,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'AU_FISCAL_START_DATE_FOR_YEAR') = 'YES'
-            THEN base.au_fiscal_start_date_for_year ELSE NULL END AS au_fiscal_start_date_for_year,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'AU_FISCAL_END_DATE_FOR_YEAR') = 'YES'
-            THEN base.au_fiscal_end_date_for_year ELSE NULL END AS au_fiscal_end_date_for_year,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'AU_FISCAL_QUARTER_START_DATE') = 'YES'
-            THEN base.au_fiscal_quarter_start_date ELSE NULL END AS au_fiscal_quarter_start_date,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'AU_FISCAL_QUARTER_END_DATE') = 'YES'
-            THEN base.au_fiscal_quarter_end_date ELSE NULL END AS au_fiscal_quarter_end_date,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'AU_FISCAL_MONTH_START_DATE') = 'YES'
-            THEN base.au_fiscal_month_start_date ELSE NULL END AS au_fiscal_month_start_date,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'AU_FISCAL_MONTH_END_DATE') = 'YES'
-            THEN base.au_fiscal_month_end_date ELSE NULL END AS au_fiscal_month_end_date,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'SAME_BUSINESS_DAY_LAST_YEAR') = 'YES'
-            THEN base.same_business_day_last_year ELSE NULL END AS same_business_day_last_year,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'TRADING_DAYS_IN_AU_FISCAL_MONTH') = 'YES'
-            THEN base.trading_days_in_au_fiscal_month ELSE NULL END AS trading_days_in_au_fiscal_month,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'TRADING_DAYS_IN_AU_FISCAL_QUARTER') = 'YES'
-            THEN base.trading_days_in_au_fiscal_quarter ELSE NULL END AS trading_days_in_au_fiscal_quarter,
+    -- Add AU Fiscal calendar columns if included
+    IF ARRAY_CONTAINS('AU_FISCAL'::VARIANT, components) THEN
+        view_sql := view_sql || ',
+        -- AU Fiscal calendar columns
+        base.au_fiscal_year_num,
+        base.au_fiscal_year_desc,
+        base.au_fiscal_quarter_num,
+        base.au_fiscal_quarter_desc,
+        base.au_fiscal_quarter_year_key,
+        base.au_fiscal_quarter_num AS au_fiscal_quarter_sort_key,
+        base.au_fiscal_month_num,
+        base.au_fiscal_month_desc,
+        base.au_fiscal_month_year_key,
+        base.au_fiscal_month_num AS au_fiscal_month_sort_key,
+        base.au_fiscal_week_num,
+        base.au_fiscal_start_date_for_year,
+        base.au_fiscal_end_date_for_year,
+        base.au_fiscal_quarter_start_date,
+        base.au_fiscal_quarter_end_date,
+        base.au_fiscal_month_start_date,
+        base.au_fiscal_month_end_date,
+        base.same_business_day_last_year,
+        base.trading_days_in_au_fiscal_month,
+        base.trading_days_in_au_fiscal_quarter';
+    END IF;
 
-        -- Retail calendar columns (conditionally included)
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_YEAR_NUM') = 'YES'
-            THEN base.retail_year_num ELSE NULL END AS retail_year_num,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_YEAR_DESC') = 'YES'
-            THEN base.retail_year_desc ELSE NULL END AS retail_year_desc,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_HALF_NUM') = 'YES'
-            THEN base.retail_half_num ELSE NULL END AS retail_half_num,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_HALF_DESC') = 'YES'
-            THEN base.retail_half_desc ELSE NULL END AS retail_half_desc,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_HALF_NUM') = 'YES'
-            THEN base.retail_half_num ELSE NULL END AS retail_half_sort_key,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_QUARTER_NUM') = 'YES'
-            THEN base.retail_quarter_num ELSE NULL END AS retail_quarter_num,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_QUARTER_DESC') = 'YES'
-            THEN base.retail_quarter_desc ELSE NULL END AS retail_quarter_desc,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_QUARTER_YEAR_KEY') = 'YES'
-            THEN base.retail_quarter_year_key ELSE NULL END AS retail_quarter_year_key,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_QUARTER_NUM') = 'YES'
-            THEN base.retail_quarter_num ELSE NULL END AS retail_quarter_sort_key,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_PERIOD_NUM') = 'YES'
-            THEN base.retail_period_num ELSE NULL END AS retail_period_num,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_PERIOD_DESC') = 'YES'
-            THEN base.retail_period_desc ELSE NULL END AS retail_period_desc,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_YEAR_MONTH_KEY') = 'YES'
-            THEN base.retail_year_month_key ELSE NULL END AS retail_year_month_key,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_PERIOD_NUM') = 'YES'
-            THEN base.retail_period_num ELSE NULL END AS retail_period_sort_key,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_MONTH_SHORT_NAME') = 'YES'
-            THEN base.retail_month_short_name ELSE NULL END AS retail_month_short_name,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_MONTH_LONG_NAME') = 'YES'
-            THEN base.retail_month_long_name ELSE NULL END AS retail_month_long_name,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_MONTH_YEAR_DESC') = 'YES'
-            THEN base.retail_month_year_desc ELSE NULL END AS retail_month_year_desc,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_MONTH_FULL_YEAR_DESC') = 'YES'
-            THEN base.retail_month_full_year_desc ELSE NULL END AS retail_month_full_year_desc,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_WEEK_NUM') = 'YES'
-            THEN base.retail_week_num ELSE NULL END AS retail_week_num,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_WEEK_NUM') = 'YES'
-            THEN base.retail_week_num ELSE NULL END AS retail_week_sort_key,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_START_OF_YEAR') = 'YES'
-            THEN base.retail_start_of_year ELSE NULL END AS retail_start_of_year,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'RETAIL_END_OF_YEAR') = 'YES'
-            THEN base.retail_end_of_year ELSE NULL END AS retail_end_of_year,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'TRADING_DAYS_IN_RETAIL_PERIOD') = 'YES'
-            THEN base.trading_days_in_retail_period ELSE NULL END AS trading_days_in_retail_period,
-        CASE WHEN COL_EXISTS('SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE', 'TRADING_DAYS_IN_RETAIL_QUARTER') = 'YES'
-            THEN base.trading_days_in_retail_quarter ELSE NULL END AS trading_days_in_retail_quarter,
+    -- Add Retail calendar columns if included
+    IF ARRAY_CONTAINS('RETAIL'::VARIANT, components) THEN
+        view_sql := view_sql || ',
+        -- Retail calendar columns
+        base.retail_year_num,
+        base.retail_year_desc,
+        base.retail_half_num,
+        base.retail_half_desc,
+        base.retail_half_num AS retail_half_sort_key,
+        base.retail_quarter_num,
+        base.retail_quarter_desc,
+        base.retail_quarter_year_key,
+        base.retail_quarter_num AS retail_quarter_sort_key,
+        base.retail_period_num,
+        base.retail_period_desc,
+        base.retail_year_month_key,
+        base.retail_period_num AS retail_period_sort_key,
+        base.retail_month_short_name,
+        base.retail_month_long_name,
+        base.retail_month_year_desc,
+        base.retail_month_full_year_desc,
+        base.retail_week_num,
+        base.retail_week_num AS retail_week_sort_key,
+        base.retail_start_of_year,
+        base.retail_end_of_year,
+        base.trading_days_in_retail_period,
+        base.trading_days_in_retail_quarter';
+    END IF;
 
+    -- Add retail season columns
+    view_sql := view_sql || ',
         -- Retail season columns
         base.retail_season,
         CASE
@@ -1652,85 +1539,308 @@ BEGIN
             WHEN base.holiday_proximity = ''Boxing Day'' THEN 2
             WHEN base.holiday_proximity = ''Post-Christmas Sale'' THEN 3
             ELSE 9
-        END AS holiday_proximity_sort_key,
+        END AS holiday_proximity_sort_key';
 
+    -- Add dynamic relative time flags
+    view_sql := view_sql || ',
         -- Dynamic relative time flags
         CASE WHEN base.date = cv.current_date_val THEN 1 ELSE 0 END AS is_current_date,
         CASE WHEN base.year_month_key = TO_NUMBER(TO_CHAR(cv.current_date_val, ''YYYYMM'')) THEN 1 ELSE 0 END AS is_current_month,
         CASE WHEN base.year_quarter_key = (YEAR(cv.current_date_val) * 10 + QUARTER(cv.current_date_val)) THEN 1 ELSE 0 END AS is_current_quarter,
-        CASE WHEN base.year_num = YEAR(cv.current_date_val) THEN 1 ELSE 0 END AS is_current_year,
+        CASE WHEN base.year_num = YEAR(cv.current_date_val) THEN 1 ELSE 0 END AS is_current_year';
 
-        -- Fiscal dynamic flags (if fiscal calendar exists)
-        CASE WHEN COL_EXISTS(''SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE'', ''AU_FISCAL_YEAR_NUM'') = ''YES'' THEN
-            CASE WHEN base.au_fiscal_year_num = cv.current_au_fiscal_year_num THEN 1 ELSE 0 END
-        ELSE NULL END AS is_current_fiscal_year,
+    -- Add fiscal dynamic flags if fiscal calendar exists
+    IF ARRAY_CONTAINS('AU_FISCAL'::VARIANT, components) THEN
+        view_sql := view_sql || ',
+        CASE WHEN base.au_fiscal_year_num = cv.current_au_fiscal_year_num THEN 1 ELSE 0 END AS is_current_fiscal_year';
+    END IF;
 
-        -- Retail dynamic flags (if retail calendar exists)
-        CASE WHEN COL_EXISTS(''SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE'', ''RETAIL_YEAR_NUM'') = ''YES'' THEN
-            CASE WHEN base.retail_year_num = cv.current_retail_year_num THEN 1 ELSE 0 END
-        ELSE NULL END AS is_current_retail_year,
+    -- Add retail dynamic flags if retail calendar exists
+    IF ARRAY_CONTAINS('RETAIL'::VARIANT, components) THEN
+        view_sql := view_sql || ',
+        CASE WHEN base.retail_year_num = cv.current_retail_year_num THEN 1 ELSE 0 END AS is_current_retail_year';
+    END IF;
 
-        -- Other dynamic flags
+    -- Add other dynamic flags
+    view_sql := view_sql || ',
         CASE WHEN base.date BETWEEN DATEADD(DAY, -6, cv.current_date_val) AND cv.current_date_val THEN 1 ELSE 0 END AS is_last_7_days,
         CASE WHEN base.date BETWEEN DATEADD(DAY, -29, cv.current_date_val) AND cv.current_date_val THEN 1 ELSE 0 END AS is_last_30_days,
-        CASE WHEN base.date BETWEEN DATEADD(DAY, -89, cv.current_date_val) AND cv.current_date_val THEN 1 ELSE 0 END AS is_last_90_days,
+CASE WHEN base.date BETWEEN DATEADD(DAY, -89, cv.current_date_val) AND cv.current_date_val THEN 1 ELSE 0 END AS is_last_90_days,
         CASE WHEN base.year_month_key = cv.prev_month_key THEN 1 ELSE 0 END AS is_previous_month,
         CASE WHEN base.year_quarter_key = cv.prev_quarter_key THEN 1 ELSE 0 END AS is_previous_quarter,
         CASE WHEN base.date BETWEEN DATEADD(MONTH, -12, cv.current_date_val) AND cv.current_date_val THEN 1 ELSE 0 END AS is_rolling_12_months,
         CASE WHEN base.date BETWEEN DATEADD(MONTH, -3, cv.current_date_val) AND cv.current_date_val THEN 1 ELSE 0 END AS is_rolling_quarter,
-        CASE WHEN base.year_num = YEAR(cv.current_date_val) AND base.date BETWEEN cv.current_year_start AND cv.current_date_val THEN 1 ELSE 0 END AS is_year_to_date,
+        CASE WHEN base.year_num = YEAR(cv.current_date_val) AND base.date BETWEEN cv.current_year_start AND cv.current_date_val THEN 1 ELSE 0 END AS is_year_to_date'';
 
-        -- Fiscal YTD (if fiscal calendar exists)
-        CASE WHEN COL_EXISTS(''SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE'', ''AU_FISCAL_YEAR_NUM'') = ''YES'' THEN
-            CASE WHEN base.au_fiscal_year_num = cv.current_au_fiscal_year_num AND base.date BETWEEN cv.current_au_fiscal_start_date AND cv.current_date_val THEN 1 ELSE 0 END
-        ELSE NULL END AS is_fiscal_year_to_date,
+    -- Add fiscal YTD if fiscal calendar exists
+    IF ARRAY_CONTAINS(''AU_FISCAL''::VARIANT, components) THEN
+        view_sql := view_sql || '',
+        CASE WHEN base.au_fiscal_year_num = cv.current_au_fiscal_year_num AND base.date BETWEEN cv.current_au_fiscal_start_date AND cv.current_date_val THEN 1 ELSE 0 END AS is_fiscal_year_to_date'';
+    END IF;
 
-        -- Retail YTD (if retail calendar exists)
-        CASE WHEN COL_EXISTS(''SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE'', ''RETAIL_YEAR_NUM'') = ''YES'' THEN
-            CASE WHEN base.retail_year_num = cv.current_retail_year_num AND base.date BETWEEN cv.current_retail_start_of_year AND cv.current_date_val THEN 1 ELSE 0 END
-        ELSE NULL END AS is_retail_year_to_date,
+    -- Add retail YTD if retail calendar exists
+    IF ARRAY_CONTAINS(''RETAIL''::VARIANT, components) THEN
+        view_sql := view_sql || '',
+        CASE WHEN base.retail_year_num = cv.current_retail_year_num AND base.date BETWEEN cv.current_retail_start_of_year AND cv.current_date_val THEN 1 ELSE 0 END AS is_retail_year_to_date'';
+    END IF;
 
-        -- More standard time-to-date flags
+    -- Add standard time-to-date flags
+    view_sql := view_sql || '',
         CASE WHEN base.year_quarter_key = (YEAR(cv.current_date_val) * 10 + QUARTER(cv.current_date_val)) AND base.date BETWEEN cv.current_quarter_start AND cv.current_date_val THEN 1 ELSE 0 END AS is_quarter_to_date,
-        CASE WHEN base.year_month_key = TO_NUMBER(TO_CHAR(cv.current_date_val, ''YYYYMM'')) AND base.date BETWEEN cv.current_month_start AND cv.current_date_val THEN 1 ELSE 0 END AS is_month_to_date
+        CASE WHEN base.year_month_key = TO_NUMBER(TO_CHAR(cv.current_date_val, ''''YYYYMM'''')) AND base.date BETWEEN cv.current_month_start AND cv.current_date_val THEN 1 ELSE 0 END AS is_month_to_date
 
-    FROM SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE base
-    CROSS JOIN current_values cv;
-    ';
+    FROM '' || base_table || '' base
+    CROSS JOIN current_values cv';
 
-    -- Add comment to the view
-    EXECUTE IMMEDIATE '
-    COMMENT ON VIEW SPG_DAP01.PBI.BUSINESS_CALENDAR IS
-    ''Comprehensive business calendar with optional Gregorian, Australian Fiscal Year, and Retail calendars.
-    Dynamically calculates relative time flags like is_current_month based on CURRENT_DATE().
-    Generated by SP_BUILD_BUSINESS_CALENDAR with parameterized configuration.'';
-    ';
+    -- Execute view creation
+    EXECUTE IMMEDIATE view_sql;
 
-    -- 12. Clean up temporary tables
-    DROP TABLE IF EXISTS date_spine_table;
-    DROP TABLE IF EXISTS temp_holidays;
-    DROP TABLE IF EXISTS temp_trading_days;
-    DROP TABLE IF EXISTS temp_retail_seasons;
+    -- Add comment on view (with proper quote escaping)
+    EXECUTE IMMEDIATE ''COMMENT ON VIEW '' || view_name || '' IS
+    ''''Comprehensive business calendar with dynamically calculated relative time flags.
+    Generated by SP_BUILD_BUSINESS_CALENDAR with modular component-based processing.
+    Supports Gregorian, AU Fiscal, and Retail calendars with proper sort keys for BI tools.'''''';
 
-    -- 13. Return status message with information about which calendars were included
+    RETURN ''Successfully created view '' || view_name;
+END;
+
+$$;
+
+-- 7. Create configuration-driven business calendar stored procedure
+create or replace procedure SPG_DAP01.PBI.SP_BUILD_BUSINESS_CALENDAR(
+  START_DATE DATE default '' 2015-01-01 '',
+  END_DATE DATE default '' 2035-12-31 '',
+  DATE_GRAIN STRING default '' day '',
+  TIMEZONE STRING default '' Australia/
+Adelaide'',
+    include_gregorian boolean default true,
+    include_au_fiscal boolean default true,
+    include_retail_calendar boolean default true,
+    retail_calendar_type string default ''
+445''
+)
+returns string
+language sql
+as
+$$
+DECLARE
+    status_message STRING DEFAULT ''SUCCESS'';
+    current_run_ts TIMESTAMP_LTZ(9);
+    components ARRAY;
+BEGIN
+    -- Set the session timezone
+    EXECUTE IMMEDIATE ''ALTER SESSION SET TIMEZONE = '''''' || timezone || '''''''';
+
+    -- Get current timestamp after timezone is set
+    current_run_ts := CURRENT_TIMESTAMP();
+
+    -- Determine which components to include
+    components := ARRAY_CONSTRUCT(''GREGORIAN'');
+    IF include_au_fiscal THEN
+        components := ARRAY_APPEND(components, ''AU_FISCAL'');
+    END IF;
+    IF include_retail_calendar THEN
+        components := ARRAY_APPEND(components, ''RETAIL'');
+    END IF;
+
+    -- 1. Generate the base Gregorian calendar
+    CREATE OR REPLACE TABLE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE AS
+    SELECT * FROM TABLE(SPG_DAP01.PBI.FN_GENERATE_GREGORIAN_CALENDAR(
+        :start_date, :end_date, :date_grain, :timezone
+    ));
+
+    -- 2. Create a temp table to store this calendar for processing by other functions
+    CREATE OR REPLACE TEMPORARY TABLE calendar_base_dates AS
+    SELECT date AS calendar_date
+    FROM SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE;
+
+    -- 3. Apply holiday processing to add holiday flags
+    CALL SPG_DAP01.PBI.PR_PROCESS_HOLIDAYS(''calendar_base_dates'', ''SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE'');
+
+    -- 4. Add AU Fiscal calendar if requested
+    IF (include_au_fiscal) THEN
+        -- Create temporary table with AU Fiscal data
+        CREATE TEMPORARY TABLE temp_au_fiscal AS
+        SELECT * FROM TABLE(SPG_DAP01.PBI.FN_GENERATE_AU_FISCAL_CALENDAR(
+            ''calendar_base_dates''
+        ));
+
+        -- Add AU Fiscal columns if they don''t exist
+        CALL SPG_DAP01.PBI.FN_ENSURE_COLUMNS_EXIST(''SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE'',
+            ARRAY_CONSTRUCT(
+                OBJECT_CONSTRUCT(''name'', ''au_fiscal_start_date_for_year'', ''type'', ''DATE''),
+                OBJECT_CONSTRUCT(''name'', ''au_fiscal_end_date_for_year'', ''type'', ''DATE''),
+                OBJECT_CONSTRUCT(''name'', ''au_fiscal_year_num'', ''type'', ''NUMBER''),
+                OBJECT_CONSTRUCT(''name'', ''au_fiscal_year_desc'', ''type'', ''STRING''),
+                OBJECT_CONSTRUCT(''name'', ''au_fiscal_quarter_num'', ''type'', ''NUMBER''),
+                OBJECT_CONSTRUCT(''name'', ''au_fiscal_quarter_year_key'', ''type'', ''NUMBER''),
+                OBJECT_CONSTRUCT(''name'', ''au_fiscal_quarter_desc'', ''type'', ''STRING''),
+                OBJECT_CONSTRUCT(''name'', ''au_fiscal_quarter_start_date'', ''type'', ''DATE''),
+                OBJECT_CONSTRUCT(''name'', ''au_fiscal_quarter_end_date'', ''type'', ''DATE''),
+                OBJECT_CONSTRUCT(''name'', ''au_fiscal_month_num'', ''type'', ''NUMBER''),
+                OBJECT_CONSTRUCT(''name'', ''au_fiscal_month_year_key'', ''type'', ''NUMBER''),
+                OBJECT_CONSTRUCT(''name'', ''au_fiscal_month_desc'', ''type'', ''STRING''),
+                OBJECT_CONSTRUCT(''name'', ''au_fiscal_month_start_date'', ''type'', ''DATE''),
+                OBJECT_CONSTRUCT(''name'', ''au_fiscal_month_end_date'', ''type'', ''DATE''),
+                OBJECT_CONSTRUCT(''name'', ''au_fiscal_week_num'', ''type'', ''NUMBER''),
+                OBJECT_CONSTRUCT(''name'', ''same_business_day_last_year'', ''type'', ''DATE'')
+            )
+        );
+
+        -- Update with AU fiscal calendar details
+        UPDATE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b
+        SET
+            au_fiscal_start_date_for_year = f.au_fiscal_start_date_for_year,
+            au_fiscal_end_date_for_year = f.au_fiscal_end_date_for_year,
+            au_fiscal_year_num = f.au_fiscal_year_num,
+            au_fiscal_year_desc = f.au_fiscal_year_desc,
+            au_fiscal_quarter_num = f.au_fiscal_quarter_num,
+            au_fiscal_quarter_year_key = f.au_fiscal_quarter_year_key,
+            au_fiscal_quarter_desc = f.au_fiscal_quarter_desc,
+            au_fiscal_quarter_start_date = f.au_fiscal_quarter_start_date,
+            au_fiscal_quarter_end_date = f.au_fiscal_quarter_end_date,
+            au_fiscal_month_num = f.au_fiscal_month_num,
+            au_fiscal_month_year_key = f.au_fiscal_month_year_key,
+            au_fiscal_month_desc = f.au_fiscal_month_desc,
+            au_fiscal_month_start_date = f.au_fiscal_month_start_date,
+            au_fiscal_month_end_date = f.au_fiscal_month_end_date,
+            au_fiscal_week_num = f.au_fiscal_week_num,
+            same_business_day_last_year = f.same_business_day_last_year
+        FROM temp_au_fiscal f
+        WHERE b.date = f.date;
+
+        -- Drop the temporary table
+        DROP TABLE IF EXISTS temp_au_fiscal;
+    END IF;
+
+    -- 5. Add Retail calendar if requested
+    IF (include_retail_calendar) THEN
+        -- Generate Retail calendar based on selected pattern
+        CREATE TEMPORARY TABLE temp_retail AS
+        SELECT * FROM TABLE(SPG_DAP01.PBI.FN_GENERATE_RETAIL_CALENDAR(
+            ''calendar_base_dates'',
+            :retail_calendar_type
+        ));
+
+        -- Add the retail calendar columns if they don''t exist
+        CALL SPG_DAP01.PBI.FN_ENSURE_COLUMNS_EXIST(''SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE'',
+            ARRAY_CONSTRUCT(
+                OBJECT_CONSTRUCT(''name'', ''retail_start_of_year'', ''type'', ''DATE''),
+                OBJECT_CONSTRUCT(''name'', ''retail_end_of_year'', ''type'', ''DATE''),
+                OBJECT_CONSTRUCT(''name'', ''retail_year_num'', ''type'', ''NUMBER''),
+                OBJECT_CONSTRUCT(''name'', ''retail_year_desc'', ''type'', ''STRING''),
+                OBJECT_CONSTRUCT(''name'', ''retail_week_num'', ''type'', ''NUMBER''),
+                OBJECT_CONSTRUCT(''name'', ''retail_half_num'', ''type'', ''NUMBER''),
+                OBJECT_CONSTRUCT(''name'', ''retail_half_desc'', ''type'', ''STRING''),
+                OBJECT_CONSTRUCT(''name'', ''retail_quarter_num'', ''type'', ''NUMBER''),
+                OBJECT_CONSTRUCT(''name'', ''retail_quarter_desc'', ''type'', ''STRING''),
+                OBJECT_CONSTRUCT(''name'', ''retail_quarter_year_key'', ''type'', ''NUMBER''),
+                OBJECT_CONSTRUCT(''name'', ''retail_period_num'', ''type'', ''NUMBER''),
+                OBJECT_CONSTRUCT(''name'', ''retail_period_desc'', ''type'', ''STRING''),
+                OBJECT_CONSTRUCT(''name'', ''retail_year_month_key'', ''type'', ''NUMBER''),
+                OBJECT_CONSTRUCT(''name'', ''retail_month_short_name'', ''type'', ''STRING''),
+                OBJECT_CONSTRUCT(''name'', ''retail_month_long_name'', ''type'', ''STRING''),
+                OBJECT_CONSTRUCT(''name'', ''retail_month_year_desc'', ''type'', ''STRING''),
+                OBJECT_CONSTRUCT(''name'', ''retail_month_full_year_desc'', ''type'', ''STRING'')
+            )
+        );
+
+        -- Update with retail calendar details
+        UPDATE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE b
+        SET
+            retail_start_of_year = r.retail_start_of_year,
+            retail_end_of_year = r.retail_end_of_year,
+            retail_year_num = r.retail_year_num,
+            retail_year_desc = r.retail_year_desc,
+            retail_week_num = r.retail_week_num,
+            retail_half_num = r.retail_half_num,
+            retail_half_desc = r.retail_half_desc,
+            retail_quarter_num = r.retail_quarter_num,
+            retail_quarter_desc = r.retail_quarter_desc,
+            retail_quarter_year_key = r.retail_quarter_year_key,
+            retail_period_num = r.retail_period_num,
+            retail_period_desc = r.retail_period_desc,
+            retail_year_month_key = r.retail_year_month_key,
+            retail_month_short_name = r.retail_month_short_name,
+            retail_month_long_name = r.retail_month_long_name,
+            retail_month_year_desc = r.retail_month_year_desc,
+            retail_month_full_year_desc = r.retail_month_full_year_desc
+        FROM temp_retail r
+        WHERE b.date = r.date;
+
+        -- Drop the temporary table
+        DROP TABLE IF EXISTS temp_retail;
+    END IF;
+
+    -- 6. Calculate trading days
+    CALL SPG_DAP01.PBI.PR_PROCESS_TRADING_DAYS(''calendar_base_dates'', ''SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE'');
+
+    -- 7. Add retail seasons
+    CALL SPG_DAP01.PBI.PR_PROCESS_RETAIL_SEASONS(''SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE'');
+
+    -- 8. Add metadata
+    CALL SPG_DAP01.PBI.FN_ENSURE_COLUMNS_EXIST(''SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE'',
+        ARRAY_CONSTRUCT(
+            OBJECT_CONSTRUCT(''name'', ''dw_created_ts'', ''type'', ''TIMESTAMP_LTZ''),
+            OBJECT_CONSTRUCT(''name'', ''dw_source_system'', ''type'', ''STRING''),
+            OBJECT_CONSTRUCT(''name'', ''dw_version_desc'', ''type'', ''STRING'')
+        )
+    );
+
+    UPDATE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE
+    SET
+        dw_created_ts = :current_run_ts,
+        dw_source_system = ''SP_BUILD_BUSINESS_CALENDAR'',
+        dw_version_desc = ''v3.0 - Component-based calendar generation'';
+
+    -- 9. Add clustering
+    ALTER TABLE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE CLUSTER BY (date);
+
+    -- 10. Create the dynamic calendar view with relative time flags
+    CALL SPG_DAP01.PBI.PR_CREATE_CALENDAR_VIEW(
+        ''SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE'',
+        ''SPG_DAP01.PBI.BUSINESS_CALENDAR'',
+        components
+    );
+
+    -- 11. Clean up temporary tables
+    DROP TABLE IF EXISTS calendar_base_dates;
+
+    -- 12. Return status message with information about which calendars were included
     LET included_calendars STRING :=
-        CASE WHEN :include_gregorian THEN 'Gregorian' ELSE '' END ||
-        CASE WHEN :include_au_fiscal THEN (CASE WHEN :include_gregorian THEN ', ' ELSE '' END) || 'AU Fiscal' ELSE '' END ||
+        CASE WHEN :include_gregorian THEN ''Gregorian'' ELSE '''' END ||
+        CASE WHEN :include_au_fiscal THEN (CASE WHEN :include_gregorian THEN '', '' ELSE '''' END) || ''AU Fiscal'' ELSE '''' END ||
         CASE WHEN :include_retail_calendar THEN
-            (CASE WHEN :include_gregorian OR :include_au_fiscal THEN ', ' ELSE '' END) ||
-            'Retail ' || :retail_calendar_type
-        ELSE '' END;
+            (CASE WHEN :include_gregorian OR :include_au_fiscal THEN '', '' ELSE '''' END) ||
+            ''Retail '' || :retail_calendar_type
+        ELSE '''' END;
 
-    status_message := 'SUCCESS: Calendar built with ' || included_calendars || ' calendars. Date range: ' ||
-                     :start_date::STRING || ' to ' || :end_date::STRING;
+    status_message := ''SUCCESS: Calendar built with '' || included_calendars || '' calendars. Date range: '' ||
+                     :start_date::STRING || '' to '' || :end_date::STRING;
     RETURN status_message;
 
 EXCEPTION
     WHEN OTHER THEN
-        status_message := 'ERROR: ' || SQLERRM;
+        status_message := ''ERROR: '' || SQLERRM;
         RETURN status_message;
-END
+END;
 $$;
+
+-- Add comment to the stored procedure
+comment on procedure SPG_DAP01.PBI.SP_BUILD_BUSINESS_CALENDAR(DATE, DATE, STRING, STRING, BOOLEAN, BOOLEAN, BOOLEAN, STRING) is
+  'Builds a comprehensive business calendar that supports Gregorian, Australian Fiscal Year (July-June),
+and Retail 4-4-5 calendars. The procedure creates a base static calendar table and a dynamic view
+with RELATIVE time flags.Use the parameters to customize which calendar types to include, date range, timezone, and retail calendar pattern.
+  This improved version uses helper functions and procedures to simplify maintenance and extension:
+  - Helper functions for column management
+  - Component-based processing of different calendar types
+  - Modular design
+with CLEAR separation of concerns
+  - Improved error handling and reporting
+
+call THIS procedure periodically to refresh the calendar, especially after adding new holiday data
+  or when extending the date range is needed.';
+
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 -- Step 7: Call stored procedure to build the Business Calendar
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -2109,3 +2219,181 @@ CROSS JOIN current_values cv;
 COMMENT ON VIEW SPG_DAP01.PBI.BUSINESS_CALENDAR IS 'View providing a comprehensive calendar dimension by combining the static BUSINESS_CALENDAR_BASE table with dynamically calculated relative time period flags (e.g., is_current_month, is_last_7_days) and sort order columns for BI tools. Use this view for all reporting and analysis. Relative flags are always up-to-date based on CURRENT_DATE() at query time. Includes jurisdiction-specific holiday flags for all Australian states and territories.';
 
 END;
+
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- STEP 9: Create calendar comparison functions as User-Defined Functions (UDFs)
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- 1. Business Day Navigation Functions
+-- Get next business day after a given date
+CREATE OR REPLACE FUNCTION FN_NEXT_BUSINESS_DAY(input_date DATE)
+RETURNS DATE
+LANGUAGE SQL
+AS
+$$
+    SELECT MIN(date)
+    FROM BUSINESS_CALENDAR
+    WHERE date > input_date
+    AND is_trading_day = 1
+$$;
+
+-- Get previous business day before a given date
+CREATE OR REPLACE FUNCTION FN_PREVIOUS_BUSINESS_DAY(input_date DATE)
+RETURNS DATE
+LANGUAGE SQL
+AS
+$$
+    SELECT MAX(date)
+    FROM BUSINESS_CALENDAR
+    WHERE date < input_date
+    AND is_trading_day = 1
+$$;
+
+-- Add N business days to a given date
+CREATE OR REPLACE FUNCTION FN_ADD_BUSINESS_DAYS(input_date DATE, days_to_add INT)
+RETURNS DATE
+LANGUAGE SQL
+AS
+$$
+    DECLARE
+        result_date DATE;
+        remaining_days INT := ABS(days_to_add);
+        direction INT := CASE WHEN days_to_add >= 0 THEN 1 ELSE -1 END;
+        current_date DATE := input_date;
+    BEGIN
+        WHILE remaining_days > 0 DO
+            -- Move one calendar day in the appropriate direction
+            current_date := DATEADD(DAY, direction, current_date);
+
+            -- Check if it's a business day
+            IF EXISTS (
+                SELECT 1 FROM BUSINESS_CALENDAR
+                WHERE date = current_date
+                AND is_trading_day = 1
+            ) THEN
+                remaining_days := remaining_days - 1;
+            END IF;
+        END WHILE;
+
+        RETURN current_date;
+    END;
+$$;
+
+-- 2. Business Day Counting Functions
+-- Count business days between two dates (inclusive)
+CREATE OR REPLACE FUNCTION FN_BUSINESS_DAYS_BETWEEN(start_date DATE, end_date DATE)
+RETURNS INT
+LANGUAGE SQL
+AS
+$$
+    DECLARE
+        biz_days INT;
+    BEGIN
+        SELECT COUNT(*)
+        INTO biz_days
+        FROM BUSINESS_CALENDAR
+        WHERE date BETWEEN start_date AND end_date
+        AND is_trading_day = 1;
+
+        RETURN biz_days;
+    END;
+$$;
+
+-- Get the Nth business day of a month
+CREATE OR REPLACE FUNCTION FN_NTH_BUSINESS_DAY_OF_MONTH(year_num INT, month_num INT, n INT)
+RETURNS DATE
+LANGUAGE SQL
+AS
+$$
+    SELECT date
+    FROM BUSINESS_CALENDAR
+    WHERE year_num = year_num
+    AND month_num = month_num
+    AND is_trading_day = 1
+    ORDER BY date
+    LIMIT 1 OFFSET (n-1);
+$$;
+
+-- Get the Nth last business day of a month
+CREATE OR REPLACE FUNCTION FN_NTH_LAST_BUSINESS_DAY_OF_MONTH(year_num INT, month_num INT, n INT)
+RETURNS DATE
+LANGUAGE SQL
+AS
+$$
+    SELECT date
+    FROM BUSINESS_CALENDAR
+    WHERE year_num = year_num
+    AND month_num = month_num
+    AND is_trading_day = 1
+    ORDER BY date DESC
+    LIMIT 1 OFFSET (n-1);
+$$;
+
+-- 3. Fiscal Calendar Functions
+-- Convert Gregorian date to Australian Fiscal Year date
+CREATE OR REPLACE FUNCTION FN_CONVERT_TO_AU_FISCAL_DATE(input_date DATE)
+RETURNS OBJECT
+LANGUAGE SQL
+AS
+$$
+    SELECT OBJECT_CONSTRUCT(
+        'au_fiscal_year_num', au_fiscal_year_num,
+        'au_fiscal_quarter_num', au_fiscal_quarter_num,
+        'au_fiscal_month_num', au_fiscal_month_num,
+        'au_fiscal_week_num', au_fiscal_week_num
+    )
+    FROM BUSINESS_CALENDAR
+    WHERE date = input_date;
+$$;
+
+-- Get equivalent date in previous Fiscal Year
+CREATE OR REPLACE FUNCTION FN_SAME_DAY_PREV_FISCAL_YEAR(input_date DATE, n_years INT DEFAULT 1)
+RETURNS DATE
+LANGUAGE SQL
+AS
+$$
+    SELECT date
+    FROM BUSINESS_CALENDAR
+    WHERE au_fiscal_month_num = (
+        SELECT au_fiscal_month_num FROM BUSINESS_CALENDAR WHERE date = input_date
+    )
+    AND au_fiscal_year_num = (
+        SELECT au_fiscal_year_num - n_years FROM BUSINESS_CALENDAR WHERE date = input_date
+    )
+    AND day_of_month_num = (
+        SELECT day_of_month_num FROM BUSINESS_CALENDAR WHERE date = input_date
+    )
+    ORDER BY date
+    LIMIT 1;
+$$;
+
+-- 4. Season Detection Functions
+-- Determine if a date falls within a specific retail season
+CREATE OR REPLACE FUNCTION FN_IS_IN_RETAIL_SEASON(input_date DATE, season_name STRING)
+RETURNS BOOLEAN
+LANGUAGE SQL
+AS
+$$
+    SELECT
+        CASE WHEN EXISTS (
+            SELECT 1
+            FROM BUSINESS_CALENDAR
+            WHERE date = input_date
+            AND retail_season = season_name
+        )
+        THEN TRUE
+        ELSE FALSE
+        END
+$$;
+
+-- Get all dates in a specific retail season for a given year
+CREATE OR REPLACE FUNCTION FN_GET_RETAIL_SEASON_DATES(year_num INT, season_name STRING)
+RETURNS TABLE(dates DATE)
+LANGUAGE SQL
+AS
+$$
+    SELECT date
+    FROM BUSINESS_CALENDAR
+    WHERE year_num = year_num
+    AND retail_season = season_name
+    ORDER BY date
+$$;
