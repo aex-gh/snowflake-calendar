@@ -13,7 +13,7 @@ CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION apis_access_integration
    TODO: need to modify for an initial load then ongoing by changing the SQL select to the YYYY0101 number for the current year. Also need to check if this returns anything because the API may change.
 */
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-CREATE OR REPLACE PROCEDURE LOAD_AU_HOLIDAYS(DATABASE_NAME VARCHAR, SCHEMA_NAME VARCHAR)
+CREATE OR REPLACE PROCEDURE SP_LOAD_AU_HOLIDAYS(DATABASE_NAME STRING, SCHEMA_NAME STRING)
 RETURNS String
 LANGUAGE PYTHON
 RUNTIME_VERSION=3.11
@@ -48,12 +48,12 @@ def create_table_if_not_exists(session, database_name, schema_name, table_name):
         CREATE TABLE IF NOT EXISTS {database_name}.{schema_name}.{table_name} (
             HOLIDAY_ID NUMBER,
             HOLIDAY_DATE DATE,
-            HOLIDAY_NAME VARCHAR(255),
-            INFORMATION VARCHAR(1000),
-            MORE_INFORMATION VARCHAR(255),
-            JURISDICTION VARCHAR(10),
+            HOLIDAY_NAME STRING,
+            INFORMATION STRING),
+            MORE_INFORMATION STRING,
+            JURISDICTION STRING),
             LOADED_AT TIMESTAMP_NTZ,
-            DATA_SOURCE VARCHAR(50)  -- New column to track data source
+            DATA_SOURCE STRING  -- New column to track data source
         )
         """
         session.sql(create_table_sql).collect()
@@ -189,10 +189,10 @@ def load_fallback_data(session, database_name, schema_name, stage_name):
             SELECT
                 $1::NUMBER AS HOLIDAY_ID,
                 TO_DATE($2, \'YYYYMMDD\') AS HOLIDAY_DATE,
-                $3::VARCHAR AS HOLIDAY_NAME,
-                $4::VARCHAR AS INFORMATION,
-                $5::VARCHAR AS MORE_INFORMATION,
-                $6::VARCHAR AS JURISDICTION
+                $3::STRING AS HOLIDAY_NAME,
+                $4::STRING AS INFORMATION,
+                $5::STRING AS MORE_INFORMATION,
+                $6::STRING AS JURISDICTION
             FROM @{database_name}.{schema_name}.{stage_name}/{FALLBACK_FILE}
             (FILE_FORMAT => \'{database_name}.{schema_name}.csv_format\')
         """).collect()
@@ -412,19 +412,19 @@ def main(session, DATABASE_NAME, SCHEMA_NAME):
 
 -- LOAD PROCEDURE EXAMPLE
 -- Example of how to call the stored procedure.  Replace with your database and schema names.
--- call load_au_holidays('SPG_DAP01','PBI');
+-- call sp_load_au_holidays('SPG_DAP01','PBI');
 
 -- DROP PROCEDURE EXAMPLE
 -- Example of how to drop the stored procedure.  Use with caution!
--- drop procedure if exists load_au_holidays(VARCHAR, VARCHAR);
+-- drop procedure if exists sp_load_au_holidays(STRING, STRING);
 
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
--- Step 3: Call LOAD_AU_HOLIDAYS(DATABASE, SCHEMA)
+-- Step 3: Create the AU_PUBLIC_HOLIDAYS table
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-call load_au_holidays('DATABASE', 'SCHEMA');
+call sp_load_au_holidays('DATABASE', 'SCHEMA');
 
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
--- Step 4: Create a view to store the public holidays and allow modification for business requirements
+-- Step 4: Create a view to store the public holidays and allow semantic modification for business requirements
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 CREATE OR REPLACE VIEW SPG_DAP01.PBI.AU_PUBLIC_HOLIDAYS_VW AS
 SELECT
@@ -434,23 +434,18 @@ SELECT
 FROM SPG_DAP01.PBI.AU_PUBLIC_HOLIDAYS;
 
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
--- Step 5: Establish local timezones for the business calendar
--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-ALTER SESSION SET TIMEZONE = 'Australia/Adelaide';
-
--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
--- STEP 6A: Create function for date spine
+-- STEP 5: Create function for date spine
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION SPG_DAP01.PBI.FN_GENERATE_DATE_SPINE(
     start_date TIMESTAMP_NTZ,
     end_date TIMESTAMP_NTZ,
-    date_grain VARCHAR,  -- 'MINUTE', 'HOUR', 'DAY', 'WEEK', 'MONTH', 'QUARTER', 'YEAR'
-    timezone VARCHAR DEFAULT 'UTC'  -- e.g., 'Australia/Sydney', 'Europe/London', 'America/New_York'
+    date_grain STRING,  -- 'MINUTE', 'HOUR', 'DAY', 'WEEK', 'MONTH', 'QUARTER', 'YEAR'
+    timezone STRING DEFAULT 'UTC'  -- e.g., 'Australia/Sydney', 'Europe/London', 'America/New_York'
 )
 RETURNS TABLE (
     calendar_date TIMESTAMP_NTZ,
     calendar_date_tz TIMESTAMP_TZ,
-    timezone VARCHAR
+    timezone STRING
 )
 AS
 $$
@@ -491,23 +486,30 @@ $$
     ORDER BY calendar_date
 $$;
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
--- STEP 6B: Create the stored procedure to build the business calendar
+-- STEP 6: Create the stored procedure to build the business calendar
 -- TODO: make the date to end a variable to pass through
 -- TODO: Qualify the F445 calendar components
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 CREATE OR REPLACE PROCEDURE SPG_DAP01.PBI.SP_BUILD_BUSINESS_CALENDAR(
     start_date DATE DEFAULT '2015-01-01',
     end_date DATE DEFAULT '2035-12-31',
-    date_grain VARCHAR DEFAULT 'DAY'
+    date_grain STRING DEFAULT 'DAY',
+    timezone STRING DEFAULT 'Australia/Adelaide'
 )
-RETURNS VARCHAR
+RETURNS STRING
 LANGUAGE SQL
 AS
 $$
 DECLARE
-    status_message VARCHAR DEFAULT 'SUCCESS';
-    current_run_ts TIMESTAMP_LTZ(9) := CURRENT_TIMESTAMP();
-BEGIN
+    status_message STRING DEFAULT 'SUCCESS';
+    current_run_ts TIMESTAMP_LTZ(9);
+ BEGIN
+    -- Set the session timezone
+    EXECUTE IMMEDIATE 'ALTER SESSION SET TIMEZONE = ''' || timezone || '''';
+
+    -- Get current timestamp after timezone is set
+    current_run_ts := CURRENT_TIMESTAMP();
+
     CREATE OR REPLACE TABLE SPG_DAP01.PBI.BUSINESS_CALENDAR_BASE
     AS
     WITH date_generator AS (
@@ -515,7 +517,8 @@ BEGIN
         FROM TABLE(SPG_DAP01.PBI.FN_GENERATE_DATE_SPINE(
             :start_date,
             :end_date,
-            :date_grain
+            :date_grain,
+             :timezone
         ))
     ),
     -- Pivot holidays by jurisdiction to avoid duplication
@@ -688,12 +691,12 @@ BEGIN
             CASE WHEN b.date >= fy.f445_start_of_year THEN FLOOR(DATEDIFF(DAY, fy.f445_start_of_year, b.date) / 7) + 1 ELSE NULL END AS f445_week_num,
             DATEDIFF(QUARTER, afy.au_fiscal_start_date_for_year, b.date) + 1 AS au_fiscal_quarter_num,
             afy.au_fiscal_year_num * 10 + (DATEDIFF(QUARTER, afy.au_fiscal_start_date_for_year, b.date) + 1) AS au_fiscal_quarter_year_key,
-            'QTR ' || (DATEDIFF(QUARTER, afy.au_fiscal_start_date_for_year, b.date) + 1)::VARCHAR AS au_fiscal_quarter_desc,
+            'QTR ' || (DATEDIFF(QUARTER, afy.au_fiscal_start_date_for_year, b.date) + 1)::STRING AS au_fiscal_quarter_desc,
             DATEADD(QUARTER, DATEDIFF(QUARTER, afy.au_fiscal_start_date_for_year, b.date), afy.au_fiscal_start_date_for_year) AS au_fiscal_quarter_start_date,
             DATEADD(DAY, -1, DATEADD(QUARTER, 1, au_fiscal_quarter_start_date)) AS au_fiscal_quarter_end_date,
             MOD(DATEDIFF(MONTH, afy.au_fiscal_start_date_for_year, b.date), 12) + 1 AS au_fiscal_month_num,
             afy.au_fiscal_year_num * 100 + (MOD(DATEDIFF(MONTH, afy.au_fiscal_start_date_for_year, b.date), 12) + 1) AS au_fiscal_month_year_key,
-            'Month ' || LPAD((MOD(DATEDIFF(MONTH, afy.au_fiscal_start_date_for_year, b.date), 12) + 1)::VARCHAR, 2, '0') AS au_fiscal_month_desc,
+            'Month ' || LPAD((MOD(DATEDIFF(MONTH, afy.au_fiscal_start_date_for_year, b.date), 12) + 1)::STRING, 2, '0') AS au_fiscal_month_desc,
             DATEADD(MONTH, DATEDIFF(MONTH, afy.au_fiscal_start_date_for_year, b.date), afy.au_fiscal_start_date_for_year) AS au_fiscal_month_start_date,
             LAST_DAY(au_fiscal_month_start_date) AS au_fiscal_month_end_date,
             FLOOR(DATEDIFF(DAY, afy.au_fiscal_start_date_for_year, b.date) / 7) + 1 AS au_fiscal_week_num
@@ -725,9 +728,9 @@ BEGIN
             CASE WHEN (f445_period_num) IN (1, 2, 3) THEN 1 WHEN (f445_period_num) IN (4, 5, 6) THEN 2 WHEN (f445_period_num) IN (7, 8, 9) THEN 3 WHEN (f445_period_num) IN (10, 11, 12) THEN 4 ELSE NULL END AS f445_quarter_num,
             cc.f445_year_num * 10 + f445_quarter_num AS f445_quarter_year_key,
             cc.f445_year_num * 100 + f445_period_num AS f445_year_month_key,
-            'HALF ' || f445_half_num::VARCHAR AS f445_half_desc,
-            'QTR ' || f445_quarter_num::VARCHAR AS f445_quarter_desc,
-            'MONTH ' || f445_period_num::VARCHAR AS f445_period_desc,
+            'HALF ' || f445_half_num::STRING AS f445_half_desc,
+            'QTR ' || f445_quarter_num::STRING AS f445_quarter_desc,
+            'MONTH ' || f445_period_num::STRING AS f445_period_desc,
             CASE f445_period_num
                     WHEN 1 THEN 'Jul' WHEN 2 THEN 'Aug' WHEN 3 THEN 'Sep' WHEN 4 THEN 'Oct'
                     WHEN 5 THEN 'Nov' WHEN 6 THEN 'Dec' WHEN 7 THEN 'Jan' WHEN 8 THEN 'Feb'
