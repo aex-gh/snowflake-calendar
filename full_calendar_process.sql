@@ -560,7 +560,7 @@ DECLARE
     sql_command STRING;
     table_type STRING := IFF(is_temporary, 'TEMPORARY TABLE', 'TABLE');
     status STRING DEFAULT 'SUCCESS';
-    function_prefix STRING := (SELECT DATABASE()) || '.' || (SELECT SCHEMA());
+    function_prefix STRING := CURRENT_DATABASE() || '.' || CURRENT_SCHEMA();
 BEGIN
     -- Build the SQL to create/replace the target table
     sql_command := '
@@ -1223,6 +1223,67 @@ $$;
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 -- STEP 6: Create the configuration-driven business calendar system
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- Create a separate procedure just for creating the calendar refresh task
+CREATE OR REPLACE PROCEDURE SP_CREATE_CALENDAR_TASK(
+    DATABASE_NAME STRING,
+    SCHEMA_NAME STRING,
+    INCLUDE_AU_FISCAL BOOLEAN DEFAULT TRUE,
+    INCLUDE_RETAIL BOOLEAN DEFAULT TRUE,
+    AUTO_ACTIVATE_TASK BOOLEAN DEFAULT FALSE
+)
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+DECLARE
+    include_fiscal_str STRING := CASE WHEN INCLUDE_AU_FISCAL THEN 'TRUE' ELSE 'FALSE' END;
+    include_retail_str STRING := CASE WHEN INCLUDE_RETAIL THEN 'TRUE' ELSE 'FALSE' END;
+    task_activation_status STRING := CASE WHEN AUTO_ACTIVATE_TASK THEN 'RESUME' ELSE 'SUSPEND' END;
+    task_name STRING := DATABASE_NAME || '.' || SCHEMA_NAME || '.REFRESH_CALENDAR_FLAGS';
+    sql_statement STRING;
+BEGIN
+    -- Create a simple task
+    sql_statement := 'CREATE OR REPLACE TASK ' || task_name || '
+        WAREHOUSE = CURRENT_WAREHOUSE()
+        SCHEDULE = ''USING CRON 0 1 * * * UTC''
+        AS
+        SELECT 1;';
+
+    BEGIN
+        EXECUTE IMMEDIATE sql_statement;
+    EXCEPTION
+        WHEN OTHER THEN
+            RETURN 'ERROR creating task: ' || SQLERRM || ' SQL: ' || sql_statement;
+    END;
+
+    -- Create the procedure call statement
+    sql_statement := 'CALL ' || DATABASE_NAME || '.' || SCHEMA_NAME || '.SP_REFRESH_CALENDAR_FLAGS('''
+        || DATABASE_NAME || ''', '''
+        || SCHEMA_NAME || ''', '
+        || include_fiscal_str || ', '
+        || include_retail_str || ');';
+
+    -- Update the task definition
+    BEGIN
+        EXECUTE IMMEDIATE 'ALTER TASK ' || task_name || ' SET DEFINITION = ''' || sql_statement || '''';
+    EXCEPTION
+        WHEN OTHER THEN
+            RETURN 'ERROR setting task definition: ' || SQLERRM;
+    END;
+
+    -- Set task state
+    BEGIN
+        EXECUTE IMMEDIATE 'ALTER TASK ' || task_name || ' ' || task_activation_status;
+    EXCEPTION
+        WHEN OTHER THEN
+            RETURN 'ERROR setting task state: ' || SQLERRM;
+    END;
+
+    RETURN 'Calendar refresh task created successfully';
+END;
+$$;
+
+-- Modify the main SP_BUILD_BUSINESS_CALENDAR procedure to remove the task creation part
 CREATE OR REPLACE PROCEDURE SP_BUILD_BUSINESS_CALENDAR(
     DATABASE_NAME STRING,
     SCHEMA_NAME STRING,
@@ -1258,6 +1319,10 @@ DECLARE
     task_activation_status STRING;
     should_add_fiscal NUMBER;
     should_add_retail NUMBER;
+    task_creation_result STRING;
+
+    -- Variables for the SQL statements
+    sql_statement STRING;
 BEGIN
     -- Initialize variables
     fully_qualified_prefix := DATABASE_NAME || '.' || SCHEMA_NAME;
@@ -1281,48 +1346,167 @@ BEGIN
     refresh_flags_proc := DATABASE_NAME || '.' || SCHEMA_NAME || '.SP_REFRESH_CALENDAR_FLAGS';
     create_view_proc := DATABASE_NAME || '.' || SCHEMA_NAME || '.SP_CREATE_CALENDAR_VIEW';
 
+    -- Check if the necessary procedures exist
+    sql_statement := 'SHOW PROCEDURES LIKE \'SP_GENERATE_GREGORIAN_CALENDAR\' IN ' || DATABASE_NAME || '.' || SCHEMA_NAME;
+    BEGIN
+        EXECUTE IMMEDIATE sql_statement;
+    EXCEPTION
+        WHEN OTHER THEN
+            RETURN 'ERROR: Required procedure SP_GENERATE_GREGORIAN_CALENDAR does not exist. Please ensure all required procedures are created first.';
+    END;
+
+    -- 0. Create the base calendar table explicitly
+    sql_statement := 'CREATE OR REPLACE TABLE ' || final_calendar_base || ' (
+        date DATE PRIMARY KEY,
+        date_key NUMBER,
+        year_num NUMBER,
+        year_desc STRING,
+        quarter_num NUMBER,
+        quarter_desc STRING,
+        year_quarter_key NUMBER,
+        month_num NUMBER,
+        month_short_name STRING,
+        month_long_name STRING,
+        year_month_key NUMBER,
+        month_year_desc STRING,
+        week_of_year_num NUMBER,
+        year_of_week_num NUMBER,
+        year_week_desc STRING,
+        iso_week_num NUMBER,
+        iso_year_of_week_num NUMBER,
+        iso_year_week_desc STRING,
+        day_of_month_num NUMBER,
+        day_of_week_num NUMBER,
+        iso_day_of_week_num NUMBER,
+        day_of_year_num NUMBER,
+        day_short_name STRING,
+        day_long_name STRING,
+        date_full_desc STRING,
+        date_formatted STRING,
+        month_start_date DATE,
+        month_end_date DATE,
+        quarter_start_date DATE,
+        quarter_end_date DATE,
+        year_start_date DATE,
+        year_end_date DATE,
+        week_start_date DATE,
+        week_end_date DATE,
+        day_of_month_count NUMBER,
+        days_in_month_count NUMBER,
+        day_of_quarter_count NUMBER,
+        days_in_quarter_count NUMBER,
+        week_of_month_num NUMBER,
+        week_of_quarter_num NUMBER,
+        is_weekday NUMBER,
+        weekday_indicator STRING,
+        same_date_last_year DATE,
+        is_holiday NUMBER DEFAULT 0,
+        holiday_indicator STRING,
+        holiday_desc STRING,
+        holiday_metadata OBJECT
+    )';
+
+    BEGIN
+        EXECUTE IMMEDIATE sql_statement;
+    EXCEPTION
+        WHEN OTHER THEN
+            RETURN 'ERROR creating base calendar table: ' || SQLERRM;
+    END;
+
     -- 1. Generate the base Gregorian calendar
-    EXECUTE IMMEDIATE 'CALL ' || calendar_proc || '('''
+    sql_statement := 'CALL ' || calendar_proc || '('''
         || START_DATE || ''', '''
         || END_DATE || ''', '''
         || DATE_GRAIN || ''', '''
         || TIMEZONE || ''', '''
-        || final_calendar_base || ''', '
-        || 'FALSE)';
+        || final_calendar_base || ''', FALSE)';
+
+    BEGIN
+        EXECUTE IMMEDIATE sql_statement;
+    EXCEPTION
+        WHEN OTHER THEN
+            RETURN 'ERROR calling SP_GENERATE_GREGORIAN_CALENDAR: ' || SQLERRM;
+    END;
 
     -- 2. Process holidays
-    EXECUTE IMMEDIATE 'CALL ' || holidays_proc || '('''
+    sql_statement := 'CALL ' || holidays_proc || '('''
         || final_calendar_base || ''', '''
         || temp_holidays || ''', '''
         || DATABASE_NAME || ''', '''
         || SCHEMA_NAME || ''')';
 
-    -- 3. Add AU Fiscal calendar if requested (using numerical check instead of boolean)
+    BEGIN
+        EXECUTE IMMEDIATE sql_statement;
+    EXCEPTION
+        WHEN OTHER THEN
+            RETURN 'ERROR calling SP_PROCESS_HOLIDAYS: ' || SQLERRM;
+    END;
+
+    -- 3. Add AU Fiscal calendar if requested
     IF (should_add_fiscal = 1) THEN
-        EXECUTE IMMEDIATE 'CALL ' || au_fiscal_proc || '('''
+        -- Call AU fiscal calendar procedure
+        sql_statement := 'CALL ' || au_fiscal_proc || '('''
             || final_calendar_base || ''', '''
             || temp_au_fiscal || ''')';
 
+        BEGIN
+            EXECUTE IMMEDIATE sql_statement;
+        EXCEPTION
+            WHEN OTHER THEN
+                RETURN 'ERROR calling SP_GENERATE_AU_FISCAL_CALENDAR: ' || SQLERRM;
+        END;
+
         -- Add the fiscal columns to the base table
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_start_date_for_year DATE';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_end_date_for_year DATE';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_year_num NUMBER';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_year_desc STRING';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_quarter_num NUMBER';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_quarter_year_key NUMBER';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_quarter_desc STRING';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_quarter_start_date DATE';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_quarter_end_date DATE';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_month_num NUMBER';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_month_year_key NUMBER';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_month_desc STRING';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_month_start_date DATE';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_month_end_date DATE';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_week_num NUMBER';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS same_business_day_last_year DATE';
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_start_date_for_year DATE';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_end_date_for_year DATE';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_year_num NUMBER';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_year_desc STRING';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_quarter_num NUMBER';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_quarter_year_key NUMBER';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_quarter_desc STRING';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_quarter_start_date DATE';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_quarter_end_date DATE';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_month_num NUMBER';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_month_year_key NUMBER';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_month_desc STRING';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_month_start_date DATE';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_month_end_date DATE';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS au_fiscal_week_num NUMBER';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS same_business_day_last_year DATE';
+        EXECUTE IMMEDIATE sql_statement;
 
         -- Update the base table with AU fiscal calendar data
-        EXECUTE IMMEDIATE 'UPDATE ' || final_calendar_base || ' b
+        sql_statement := 'UPDATE ' || final_calendar_base || ' b
         SET
             b.au_fiscal_start_date_for_year = f.au_fiscal_start_date_for_year,
             b.au_fiscal_end_date_for_year = f.au_fiscal_end_date_for_year,
@@ -1342,36 +1526,78 @@ BEGIN
             b.same_business_day_last_year = f.same_business_day_last_year
         FROM ' || temp_au_fiscal || ' f
         WHERE b.date = f.date';
+        EXECUTE IMMEDIATE sql_statement;
     END IF;
 
-    -- 4. Add Retail calendar if requested (using numerical check instead of boolean)
+    -- 4. Add Retail calendar if requested
     IF (should_add_retail = 1) THEN
-        EXECUTE IMMEDIATE 'CALL ' || retail_proc || '('''
+        -- Call Retail calendar procedure
+        sql_statement := 'CALL ' || retail_proc || '('''
             || final_calendar_base || ''', '''
             || temp_retail || ''', '''
             || RETAIL_PATTERN || ''')';
 
+        BEGIN
+            EXECUTE IMMEDIATE sql_statement;
+        EXCEPTION
+            WHEN OTHER THEN
+                RETURN 'ERROR calling SP_GENERATE_RETAIL_CALENDAR: ' || SQLERRM;
+        END;
+
         -- Add the retail columns to the base table
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_start_of_year DATE';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_end_of_year DATE';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_year_num NUMBER';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_year_desc STRING';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_week_num NUMBER';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_half_num NUMBER';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_half_desc STRING';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_quarter_num NUMBER';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_quarter_desc STRING';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_quarter_year_key NUMBER';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_period_num NUMBER';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_period_desc STRING';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_year_month_key NUMBER';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_month_short_name STRING';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_month_long_name STRING';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_month_year_desc STRING';
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_month_full_year_desc STRING';
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_start_of_year DATE';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_end_of_year DATE';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_year_num NUMBER';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_year_desc STRING';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_week_num NUMBER';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_half_num NUMBER';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_half_desc STRING';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_quarter_num NUMBER';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_quarter_desc STRING';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_quarter_year_key NUMBER';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_period_num NUMBER';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_period_desc STRING';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_year_month_key NUMBER';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_month_short_name STRING';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_month_long_name STRING';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_month_year_desc STRING';
+        EXECUTE IMMEDIATE sql_statement;
+
+        sql_statement := 'ALTER TABLE ' || final_calendar_base || ' ADD COLUMN IF NOT EXISTS retail_month_full_year_desc STRING';
+        EXECUTE IMMEDIATE sql_statement;
 
         -- Update the base table with retail calendar data
-        EXECUTE IMMEDIATE 'UPDATE ' || final_calendar_base || ' b
+        sql_statement := 'UPDATE ' || final_calendar_base || ' b
         SET
             b.retail_start_of_year = r.retail_start_of_year,
             b.retail_end_of_year = r.retail_end_of_year,
@@ -1392,53 +1618,93 @@ BEGIN
             b.retail_month_full_year_desc = r.retail_month_full_year_desc
         FROM ' || temp_retail || ' r
         WHERE b.date = r.date';
+        EXECUTE IMMEDIATE sql_statement;
     END IF;
 
     -- 5. Process retail seasons
-    EXECUTE IMMEDIATE 'CALL ' || seasons_proc || '('''
+    sql_statement := 'CALL ' || seasons_proc || '('''
         || DATABASE_NAME || ''', '''
         || SCHEMA_NAME || ''')';
 
+    BEGIN
+        EXECUTE IMMEDIATE sql_statement;
+    EXCEPTION
+        WHEN OTHER THEN
+            RETURN 'ERROR calling SP_PROCESS_RETAIL_SEASONS: ' || SQLERRM;
+    END;
+
     -- 6. Create static calendar view
-    EXECUTE IMMEDIATE 'CREATE OR REPLACE VIEW ' || DATABASE_NAME || '.' || SCHEMA_NAME || '.BUSINESS_CALENDAR_STATIC AS
+    sql_statement := 'CREATE OR REPLACE VIEW ' || DATABASE_NAME || '.' || SCHEMA_NAME || '.BUSINESS_CALENDAR_STATIC AS
     SELECT * FROM ' || final_calendar_base;
 
+    BEGIN
+        EXECUTE IMMEDIATE sql_statement;
+    EXCEPTION
+        WHEN OTHER THEN
+            RETURN 'ERROR creating BUSINESS_CALENDAR_STATIC view: ' || SQLERRM;
+    END;
+
     -- 7. Perform initial population of the dynamic flags table
-    EXECUTE IMMEDIATE 'CALL ' || refresh_flags_proc || '('''
+    sql_statement := 'CALL ' || refresh_flags_proc || '('''
         || DATABASE_NAME || ''', '''
         || SCHEMA_NAME || ''', '
         || include_fiscal_str || ', '
         || include_retail_str || ')';
 
+    BEGIN
+        EXECUTE IMMEDIATE sql_statement;
+    EXCEPTION
+        WHEN OTHER THEN
+            RETURN 'ERROR calling SP_REFRESH_CALENDAR_FLAGS: ' || SQLERRM;
+    END;
+
     -- 8. Create the combined calendar view
-    EXECUTE IMMEDIATE 'CALL ' || create_view_proc || '('''
+    sql_statement := 'CALL ' || create_view_proc || '('''
         || DATABASE_NAME || ''', '''
         || SCHEMA_NAME || ''')';
 
-    -- 9. Create or replace the scheduled task for daily flag refreshes
-    EXECUTE IMMEDIATE 'CREATE OR REPLACE TASK ' || DATABASE_NAME || '.' || SCHEMA_NAME || '.REFRESH_CALENDAR_FLAGS
-      WAREHOUSE = CURRENT_WAREHOUSE()
-      SCHEDULE = ''USING CRON 0 1 * * * UTC''
-      AS
-      CALL ' || DATABASE_NAME || '.' || SCHEMA_NAME || '.SP_REFRESH_CALENDAR_FLAGS('''
-      || DATABASE_NAME || ''', ''' || SCHEMA_NAME || ''', '
-      || include_fiscal_str || ', '
-      || include_retail_str || ');';
+    BEGIN
+        EXECUTE IMMEDIATE sql_statement;
+    EXCEPTION
+        WHEN OTHER THEN
+            RETURN 'ERROR calling SP_CREATE_CALENDAR_VIEW: ' || SQLERRM;
+    END;
 
-    -- Set task state based on AUTO_ACTIVATE_TASK parameter
-    EXECUTE IMMEDIATE 'ALTER TASK ' || DATABASE_NAME || '.' || SCHEMA_NAME || '.REFRESH_CALENDAR_FLAGS ' || task_activation_status;
+    -- 9. Create the calendar task using the separate procedure
+    sql_statement := 'CALL ' || DATABASE_NAME || '.' || SCHEMA_NAME || '.SP_CREATE_CALENDAR_TASK('''
+        || DATABASE_NAME || ''', '''
+        || SCHEMA_NAME || ''', '
+        || include_fiscal_str || ', '
+        || include_retail_str || ', '
+        || CASE WHEN AUTO_ACTIVATE_TASK THEN 'TRUE' ELSE 'FALSE' END || ')';
+
+    BEGIN
+        EXECUTE IMMEDIATE sql_statement;
+        SELECT LAST_QUERY_ID() INTO task_creation_result;
+    EXCEPTION
+        WHEN OTHER THEN
+            -- Just log the error but continue with other steps
+            task_creation_result := 'ERROR creating task: ' || SQLERRM;
+    END;
 
     -- 10. Clean up temporary tables
-    EXECUTE IMMEDIATE 'DROP TABLE IF EXISTS ' || temp_holidays;
-    EXECUTE IMMEDIATE 'DROP TABLE IF EXISTS ' || temp_au_fiscal;
-    EXECUTE IMMEDIATE 'DROP TABLE IF EXISTS ' || temp_retail;
+    sql_statement := 'DROP TABLE IF EXISTS ' || temp_holidays;
+    EXECUTE IMMEDIATE sql_statement;
+
+    sql_statement := 'DROP TABLE IF EXISTS ' || temp_au_fiscal;
+    EXECUTE IMMEDIATE sql_statement;
+
+    sql_statement := 'DROP TABLE IF EXISTS ' || temp_retail;
+    EXECUTE IMMEDIATE sql_statement;
 
     -- 11. Add clustering to the base table for better performance
-    EXECUTE IMMEDIATE 'ALTER TABLE ' || final_calendar_base || ' CLUSTER BY (date)';
+    sql_statement := 'ALTER TABLE ' || final_calendar_base || ' CLUSTER BY (date)';
+    EXECUTE IMMEDIATE sql_statement;
 
     -- Return simple status message
     RETURN status_message || ' Calendar built in ' || fully_qualified_prefix ||
-           ' with date range: ' || START_DATE::STRING || ' to ' || END_DATE::STRING;
+           ' with date range: ' || START_DATE::STRING || ' to ' || END_DATE::STRING ||
+           '. Task creation: ' || task_creation_result;
 
 EXCEPTION
     WHEN OTHER THEN
@@ -1447,139 +1713,10 @@ END;
 $$;
 
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
--- Step 6A: Create procedures for calendar maintenance
--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-CREATE OR REPLACE PROCEDURE SP_REFRESH_CALENDAR_ONLY(
-    DATABASE_NAME STRING,
-    SCHEMA_NAME STRING
-)
-RETURNS STRING
-LANGUAGE SQL
-AS
-$$
-DECLARE
-    refresh_status STRING;
-    au_fiscal_exists BOOLEAN;
-    retail_exists BOOLEAN;
-    proc_prefix STRING;
-    check_columns_sql STRING;
-    count_val NUMBER;
-    call_stmt STRING;
-BEGIN
-    -- Set the procedure prefix
-    proc_prefix := DATABASE_NAME || '.' || SCHEMA_NAME || '.';
-
-    -- Check if calendar components exist - check for au_fiscal_year_num column
-    check_columns_sql := 'SELECT COUNT(*) AS count_val
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = UPPER(''' || SCHEMA_NAME || ''')
-        AND TABLE_NAME = ''BUSINESS_CALENDAR_BASE''
-        AND COLUMN_NAME = ''AU_FISCAL_YEAR_NUM''';
-
-    EXECUTE IMMEDIATE :check_columns_sql;
-    au_fiscal_exists := FALSE;
-
-    BEGIN
-        SELECT COUNT_VAL INTO :count_val FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
-        IF (count_val > 0) THEN
-            au_fiscal_exists := TRUE;
-        END IF;
-    EXCEPTION
-        WHEN OTHER THEN
-            au_fiscal_exists := FALSE;
-    END;
-
-    -- Check for retail_year_num column
-    check_columns_sql := 'SELECT COUNT(*) AS count_val
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = UPPER(''' || SCHEMA_NAME || ''')
-        AND TABLE_NAME = ''BUSINESS_CALENDAR_BASE''
-        AND COLUMN_NAME = ''RETAIL_YEAR_NUM''';
-
-    EXECUTE IMMEDIATE :check_columns_sql;
-    retail_exists := FALSE;
-
-    BEGIN
-        SELECT COUNT_VAL INTO :count_val FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
-        IF (count_val > 0) THEN
-            retail_exists := TRUE;
-        END IF;
-    EXCEPTION
-        WHEN OTHER THEN
-            retail_exists := FALSE;
-    END;
-
-    -- Call the refresh procedure with existing calendar component flags
-    call_stmt := 'CALL ' || proc_prefix || 'SP_REFRESH_CALENDAR_FLAGS('''
-        || DATABASE_NAME || ''', '''
-        || SCHEMA_NAME || ''', '
-        || (CASE WHEN au_fiscal_exists THEN 'TRUE' ELSE 'FALSE' END) || ', '
-        || (CASE WHEN retail_exists THEN 'TRUE' ELSE 'FALSE' END) || ')';
-
-    EXECUTE IMMEDIATE :call_stmt;
-
-    SELECT * INTO :refresh_status FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
-
-    RETURN refresh_status;
-EXCEPTION
-    WHEN OTHER THEN
-        RETURN 'ERROR in SP_REFRESH_CALENDAR_ONLY: ' || SQLERRM;
-END;
-$$;
-
--- Procedure to verify and activate the task if not already running
-CREATE OR REPLACE PROCEDURE SP_ACTIVATE_CALENDAR_TASK(
-    DATABASE_NAME STRING,
-    SCHEMA_NAME STRING
-)
-RETURNS STRING
-LANGUAGE SQL
-AS
-$$
-DECLARE
-    task_exists BOOLEAN DEFAULT FALSE;
-    task_state STRING DEFAULT NULL;
-    task_name STRING;
-    task_count NUMBER;
-BEGIN
-    -- Set the task name
-    task_name := DATABASE_NAME || '.' || SCHEMA_NAME || '.REFRESH_CALENDAR_FLAGS';
-
-    -- Check if task exists using SHOW TASKS
-    EXECUTE IMMEDIATE 'SHOW TASKS LIKE ''' || task_name || ''' IN ' || DATABASE_NAME || '.' || SCHEMA_NAME;
-
-    -- Get the count of matching tasks
-    SELECT COUNT(*) INTO :task_count FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
-
-    -- Set task_exists based on count
-    IF (task_count > 0) THEN
-        task_exists := TRUE;
-
-        -- Get the state of the task
-        EXECUTE IMMEDIATE 'SELECT "state" FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) LIMIT 1';
-        SELECT * INTO :task_state FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
-    END IF;
-
-    -- Check if task exists
-    IF (NOT task_exists) THEN
-        RETURN 'ERROR: Calendar refresh task does not exist. Run SP_BUILD_BUSINESS_CALENDAR first.';
-    END IF;
-
-    -- Resume task if it's suspended
-    IF (task_state = 'SUSPENDED') THEN
-        EXECUTE IMMEDIATE 'ALTER TASK ' || task_name || ' RESUME';
-        RETURN 'Calendar refresh task activated successfully.';
-    ELSE
-        RETURN 'Calendar refresh task is already active.';
-    END IF;
-END;
-$$;
-
--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 -- Step 7: Call stored procedure to build the Business Calendar
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 -- Example of how to call the stored procedure with parameters
-CALL SP_BUILD_BUSINESS_CALENDAR(
+CALL spg_dap01.pbi.SP_BUILD_BUSINESS_CALENDAR(
     'spg_dap01',  -- DATABASE_NAME
     'pbi',        -- SCHEMA_NAME
     '2015-01-01', -- START_DATE
@@ -1591,6 +1728,8 @@ CALL SP_BUILD_BUSINESS_CALENDAR(
     '445',        -- RETAIL_PATTERN
     TRUE         -- AUTO_ACTIVATE_TASK (set to TRUE if you want to automatically activate the refresh task)
 );
+
+CALL spg_dap01.pbi.SP_BUILD_BUSINESS_CALENDAR('spg_dap01', 'pbi', '2015-01-01', '2035-12-31', 'day', 'Australia/Adelaide', FALSE, FALSE, FALSE);
 
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 -- Step 8: Create calendar comparison functions as User-Defined Functions (UDFs)
