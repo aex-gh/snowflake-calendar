@@ -9,9 +9,6 @@ CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION apis_access_integration
 
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 -- Step 2: Setup LOAD_AU_HOLIDAYS(DATABASE_NAME, SCHEMA_NAME) stored procedure
-/* TODO: rework to bring in all holidays using https://data.gov.au/data/api/action/datastore_search_sql?sql=SELECT%20*%20from%20%2233673aca-0857-42e5-b8f0-9981b4755686%22%20WHERE%20%22Date%22%20%3E=%20%2720210101%27.
-   TODO: need to modify for an initial load then ongoing by changing the SQL select to the YYYY0101 number for the current year. Also need to check if this returns anything because the API may change.
-*/
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 CREATE OR REPLACE PROCEDURE SP_LOAD_AU_HOLIDAYS(DATABASE_NAME STRING, SCHEMA_NAME STRING)
 RETURNS String
@@ -492,15 +489,7 @@ $$;
 CREATE OR REPLACE FUNCTION SPG_DAP01.PBI.FN_PROCESS_HOLIDAYS(calendar_table STRING)
 RETURNS TABLE (
     date DATE,
-    is_holiday_nsw NUMBER(1,0),
-    is_holiday_vic NUMBER(1,0),
-    is_holiday_qld NUMBER(1,0),
-    is_holiday_sa NUMBER(1,0),
-    is_holiday_wa NUMBER(1,0),
-    is_holiday_tas NUMBER(1,0),
-    is_holiday_act NUMBER(1,0),
-    is_holiday_nt NUMBER(1,0),
-    is_holiday_national NUMBER(1,0),
+    holiday_metadata OBJECT,
     is_holiday NUMBER(1,0),
     holiday_indicator STRING,
     holiday_desc STRING
@@ -510,42 +499,35 @@ $$
     WITH holiday_by_jurisdiction AS (
         SELECT
             h.DATE,
-            MAX(CASE WHEN UPPER(h.STATE) = 'NSW' THEN 1 ELSE 0 END) AS is_holiday_nsw,
-            MAX(CASE WHEN UPPER(h.STATE) = 'VIC' THEN 1 ELSE 0 END) AS is_holiday_vic,
-            MAX(CASE WHEN UPPER(h.STATE) = 'QLD' THEN 1 ELSE 0 END) AS is_holiday_qld,
-            MAX(CASE WHEN UPPER(h.STATE) = 'SA' THEN 1 ELSE 0 END) AS is_holiday_sa,
-            MAX(CASE WHEN UPPER(h.STATE) = 'WA' THEN 1 ELSE 0 END) AS is_holiday_wa,
-            MAX(CASE WHEN UPPER(h.STATE) = 'TAS' THEN 1 ELSE 0 END) AS is_holiday_tas,
-            MAX(CASE WHEN UPPER(h.STATE) = 'ACT' THEN 1 ELSE 0 END) AS is_holiday_act,
-            MAX(CASE WHEN UPPER(h.STATE) = 'NT' THEN 1 ELSE 0 END) AS is_holiday_nt,
-            CASE
-                -- If already marked as NATIONAL in the data
-                WHEN MAX(CASE WHEN UPPER(STATE) = 'NATIONAL' THEN 1 ELSE 0 END) = 1 THEN 1
-                -- If all states/territories have the same holiday
-                WHEN MIN(CASE
-                        WHEN UPPER(STATE) IN ('NSW', 'VIC', 'QLD', 'SA', 'WA', 'TAS', 'ACT', 'NT') THEN 1
-                        ELSE 0
-                        END) = 1
-                AND COUNT(DISTINCT UPPER(STATE)) >= 8 THEN 1
-                ELSE 0
-            END AS is_holiday_national,
+            -- Create a flexible object with jurisdiction flags
+            OBJECT_CONSTRUCT(
+                'is_holiday_nsw', MAX(CASE WHEN UPPER(h.STATE) = 'NSW' THEN 1 ELSE 0 END),
+                'is_holiday_vic', MAX(CASE WHEN UPPER(h.STATE) = 'VIC' THEN 1 ELSE 0 END),
+                'is_holiday_qld', MAX(CASE WHEN UPPER(h.STATE) = 'QLD' THEN 1 ELSE 0 END),
+                'is_holiday_sa', MAX(CASE WHEN UPPER(h.STATE) = 'SA' THEN 1 ELSE 0 END),
+                'is_holiday_wa', MAX(CASE WHEN UPPER(h.STATE) = 'WA' THEN 1 ELSE 0 END),
+                'is_holiday_tas', MAX(CASE WHEN UPPER(h.STATE) = 'TAS' THEN 1 ELSE 0 END),
+                'is_holiday_act', MAX(CASE WHEN UPPER(h.STATE) = 'ACT' THEN 1 ELSE 0 END),
+                'is_holiday_nt', MAX(CASE WHEN UPPER(h.STATE) = 'NT' THEN 1 ELSE 0 END),
+                'is_holiday_national', CASE
+                    WHEN MAX(CASE WHEN UPPER(STATE) = 'NATIONAL' THEN 1 ELSE 0 END) = 1 THEN 1
+                    WHEN MIN(CASE
+                            WHEN UPPER(STATE) IN ('NSW', 'VIC', 'QLD', 'SA', 'WA', 'TAS', 'ACT', 'NT') THEN 1
+                            ELSE 0
+                            END) = 1
+                    AND COUNT(DISTINCT UPPER(STATE)) >= 8 THEN 1
+                    ELSE 0
+                END
+            ) AS holiday_metadata,
             -- Combine holiday names with states in parentheses
-            LISTAGG(DISTINCT HOLIDAY_NAME || ' (' || STATE || ')', '; ')  AS holiday_names
+            LISTAGG(DISTINCT HOLIDAY_NAME || ' (' || UPPER(STATE) || ')', '; ') AS holiday_names
         FROM SPG_DAP01.PBI.AU_PUBLIC_HOLIDAYS_VW h
         GROUP BY h.DATE
     ),
     calendar_with_holidays AS (
         SELECT
             cal.calendar_date AS date,
-            COALESCE(h.is_holiday_nsw, 0) AS is_holiday_nsw,
-            COALESCE(h.is_holiday_vic, 0) AS is_holiday_vic,
-            COALESCE(h.is_holiday_qld, 0) AS is_holiday_qld,
-            COALESCE(h.is_holiday_sa, 0) AS is_holiday_sa,
-            COALESCE(h.is_holiday_wa, 0) AS is_holiday_wa,
-            COALESCE(h.is_holiday_tas, 0) AS is_holiday_tas,
-            COALESCE(h.is_holiday_act, 0) AS is_holiday_act,
-            COALESCE(h.is_holiday_nt, 0) AS is_holiday_nt,
-            COALESCE(h.is_holiday_national, 0) AS is_holiday_national,
+            COALESCE(h.holiday_metadata, OBJECT_CONSTRUCT()) AS holiday_metadata,
             h.holiday_names AS holiday_desc,
             -- A date is a holiday if it's a holiday in any jurisdiction
             CASE WHEN h.DATE IS NOT NULL THEN 1 ELSE 0 END AS is_holiday,
@@ -555,21 +537,12 @@ $$
     )
     SELECT
         date,
-        is_holiday_nsw,
-        is_holiday_vic,
-        is_holiday_qld,
-        is_holiday_sa,
-        is_holiday_wa,
-        is_holiday_tas,
-        is_holiday_act,
-        is_holiday_nt,
-        is_holiday_national,
+        holiday_metadata,
         is_holiday,
         holiday_indicator,
         holiday_desc
     FROM calendar_with_holidays
 $$;
-
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 -- STEP 5C: Create function for Gregorian calendar
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -1040,8 +1013,6 @@ $$;
 
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 -- STEP 6: Create the stored procedure to build the business calendar
--- TODO: make the date to end a variable to pass through
--- TODO: Qualify the F445 calendar components
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 CREATE OR REPLACE PROCEDURE SPG_DAP01.PBI.SP_BUILD_BUSINESS_CALENDAR(
     start_date DATE DEFAULT '2015-01-01',
